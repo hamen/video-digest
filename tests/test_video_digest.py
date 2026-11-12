@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s tests
 """
 import importlib.machinery
 import importlib.util
+import html
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -74,6 +76,12 @@ class FakeTelegram:
     def stop(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+def parsed_len(mod, block):
+    """Length as Telegram counts it: after it parses the HTML tags and entities."""
+    import re
+    return mod.tg_len(html.unescape(re.sub(r"<[^>]+>", "", block)))
 
 
 def message(update_id, text, chat=OWNER):
@@ -330,7 +338,7 @@ class VideoDigestTest(unittest.TestCase):
     def test_x_button_posts_the_x_draft_once(self):
         item = self.ready_item()
         self.press(f"vd:{item['id']}:x")
-        self.assertEqual(self.posts(), ['post bird ["tweet", "Post about One"]'])
+        self.assertEqual(self.posts(), ['post bird ["tweet", "--", "Post about One"]'])
         self.assertTrue(self.items()[0].get("posted_x"))
         report = self.tg.sent()[0]
         self.assertEqual(report["text"], "✓ X: posted")
@@ -338,6 +346,40 @@ class VideoDigestTest(unittest.TestCase):
         self.press(f"vd:{item['id']}:x", update_id=51)
         self.assertEqual(len(self.posts()), 1)
         self.assertIn("already posted", self.tg.sent()[0]["text"])
+
+    def test_failed_save_after_a_post_never_posts_again(self):
+        item = self.ready_item()
+        mod = load_module()
+        cb = {"id": "cb1", "from": {"id": int(OWNER)}, "data": f"vd:{item['id']}:x"}
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(mod, "update_item", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    mod.handle_callback(cb, OWNER)  # posted, then the save failed: no ack
+            mod.handle_callback(cb, OWNER)  # Telegram resends the same press
+        self.assertEqual(len(self.posts()), 1)
+        self.assertIn("did not finish", self.tg.sent()[-1]["text"])
+
+    def test_displayed_draft_is_the_published_draft(self):
+        self.queue("https://youtu.be/one?title=" + "%26" * 600)
+        self.run_tool("process", FAKE_SUM="sections")
+        shown = self.tg.sent()[0]["text"]
+        item = self.items()[0]
+        self.press(f"vd:{item['id']}:x")
+        published = json.loads(self.posts()[0][len("post bird "):])[-1]
+        self.assertTrue(published.startswith("Post about &&&"))
+        self.assertIn(f"<blockquote>{html.escape(published, quote=False)}</blockquote>", shown)
+
+    def test_draft_starting_with_a_dash_is_not_a_flag(self):
+        item = self.ready_item()
+        self.press(f"vd:{item['id']}:x")
+        argv = json.loads(self.posts()[0][len("post bird "):])
+        self.assertEqual(argv[:2], ["tweet", "--"])
+
+    def test_link_queued_during_processing_joins_the_run(self):
+        self.queue("https://youtu.be/one")
+        r = self.run_tool("process", FAKE_GRAB_QUEUE_URL="https://youtu.be/two")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([i["status"] for i in self.items()], ["done", "done"])
 
     def test_linkedin_button_uses_buffer_share_now(self):
         item = self.ready_item()
@@ -399,7 +441,7 @@ class VideoDigestTest(unittest.TestCase):
         item = {"url": "https://x.example/v", "status": "done", "uploader": "u",
                 "title": "&" * 2000, "summary": "<b>" * 2000}
         block = mod.format_item(item)
-        self.assertLess(mod.tg_len(block), 4096)
+        self.assertLess(parsed_len(mod, block), 4096)
         # every & is part of a whole entity: no "&am" or "&l" fragment at a cut
         self.assertNotRegex(block.replace("&amp;", "").replace("&lt;", "").replace("&gt;", ""), "&")
 
@@ -417,7 +459,7 @@ class VideoDigestTest(unittest.TestCase):
         item = {"url": "https://x.example/" + "p" * 280, "status": "done", "uploader": "&" * 500,
                 "title": "&" * 2000, "summary": "&" * 5000, "x_post": "&" * 5000,
                 "linkedin_post": "&" * 5000}
-        self.assertLessEqual(mod.tg_len(mod.format_item(item)), 4096)
+        self.assertLessEqual(parsed_len(mod, mod.format_item(item)), 4096)
 
     def test_tg_len_counts_emoji_as_two(self):
         mod = load_module()

@@ -171,8 +171,10 @@ def kick_processing():
     if not cmd:
         return
     try:
-        subprocess.Popen(shlex.split(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as e:
+        # --no-block returns at once; run() also reaps the child, Popen would leave a zombie.
+        subprocess.run(shlex.split(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
         log(f"could not start processing: {e}")
 
 
@@ -211,6 +213,39 @@ def answer(cb, text):
 
 
 TARGETS = {"x": ["x"], "li": ["linkedin"], "both": ["x", "linkedin"]}
+DESTS = {"x": ("X", "x_post", "posted_x", "posting_x"),
+         "linkedin": ("LinkedIn", "linkedin_post", "posted_linkedin", "posting_linkedin")}
+
+
+def update_item(item_id_, **fields):
+    with items() as data:
+        for i in data:
+            if i.get("id") == item_id_:
+                i.update(fields)
+                for k in [k for k, v in fields.items() if v is None]:
+                    i.pop(k)
+
+
+def claim(item_id_, dest):
+    """Under the lock: check the destination and record the attempt BEFORE posting.
+
+    Returns (draft, None) when this press may post, or (None, reason) when it may not.
+    The attempt mark stays when the result is unknown (a crash, or a failed save after a
+    successful post), so a resent update or a second listener never posts twice."""
+    name, key, flag, attempt = DESTS[dest]
+    with items() as data:
+        item = next((i for i in data if i.get("id") == item_id_), None)
+        if item is None:
+            return None, f"✗ {name}: the video is no longer in the list"
+        if item.get(flag):
+            return None, f"✓ {name}: already posted, skipped"
+        if item.get(attempt):
+            return None, (f"? {name}: an earlier attempt ({item[attempt]}) did not finish. "
+                          f"Check {name}; not retried")
+        if not item.get(key):
+            return None, f"✗ {name}: no draft for this video"
+        item[attempt] = now()
+        return item[key], None
 
 
 def handle_callback(cb, owner):
@@ -233,20 +268,14 @@ def handle_callback(cb, owner):
     answer(cb, "Posting…")
     lines = []
     for dest in TARGETS[parts[2]]:
-        name, key, flag = (("X", "x_post", "posted_x") if dest == "x"
-                           else ("LinkedIn", "linkedin_post", "posted_linkedin"))
-        if item.get(flag):
-            lines.append(f"✓ {name}: already posted, skipped")
+        name, _, flag, attempt = DESTS[dest]
+        text, reason = claim(item["id"], dest)
+        if reason:
+            lines.append(reason)
             continue
-        if not item.get(key):
-            lines.append(f"✗ {name}: no draft for this video")
-            continue
-        ok, detail = post_x(item[key]) if dest == "x" else post_linkedin(item[key])
-        if ok:
-            with items() as data:
-                for i in data:
-                    if i.get("id") == item["id"]:
-                        i[flag] = now()
+        ok, detail = post_x(text) if dest == "x" else post_linkedin(text)
+        # A failed save here propagates: the attempt mark stays and blocks any repost.
+        update_item(item["id"], **({flag: now(), attempt: None} if ok else {attempt: None}))
         lines.append(f"{'✓' if ok else '✗'} {name}: {'posted' if ok else detail}")
     log(f"[{item['id']}] " + " | ".join(lines))
     try:
@@ -275,7 +304,7 @@ def run_cli(cmd, env=None):
 
 
 def post_x(text):
-    return run_cli(shlex.split(os.environ.get("VD_BIRD", "bird")) + ["tweet", text])
+    return run_cli(shlex.split(os.environ.get("VD_BIRD", "bird")) + ["tweet", "--", text])
 
 
 def post_linkedin(text):
@@ -368,23 +397,36 @@ def process_one(item):
         raise RuntimeError("grab failed: " + (res.stderr.strip().splitlines() or ["no output"])[-1])
     folder = Path(lines[-1])
     info, summary = summarize(folder)
+    sections = parse_sections(summary)
+    # Store the drafts as the message shows them: a button publishes exactly what was seen.
+    for key, budget in DRAFT_BUDGETS.items():
+        sections[key] = clip(sections[key], budget)
     return {"folder": str(folder), "title": info.get("title") or item["url"],
             "uploader": info.get("uploader") or "", "duration": info.get("duration"),
-            **parse_sections(summary)}
+            **sections}
 
 
 def cmd_process():
-    with items() as data:
-        pending = [i["url"] for i in data if i["status"] == "queued"]
-    for url in pending:
+    tried = set()
+    while True:
+        # Read the queue again after each video: a link queued meanwhile joins this run,
+        # because starting the unit while it runs does not start a second run.
+        with items() as data:
+            url = next((i["url"] for i in data
+                        if i["status"] == "queued" and i["url"] not in tried), None)
+        if url is None:
+            break
+        tried.add(url)
         log(f"processing {url}")
         # Work outside the lock: grab and the summary take minutes, and listen must keep queuing.
         try:
             result, error = process_one({"url": url}), None
-        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as e:
-            result, error = None, str(e)
+        except Exception as e:  # one bad video is a failed attempt, never the end of the queue
+            result, error = None, f"{type(e).__name__}: {e}"
         with items() as data:
-            item = next(i for i in data if i["url"] == url)
+            item = next((i for i in data if i["url"] == url), None)
+            if item is None:
+                continue
             item["attempts"] += 1
             if result:
                 item.update(result, status="done", processed_at=now())
@@ -442,17 +484,21 @@ def tg_len(text):
     return len(text.encode("utf-16-le")) // 2
 
 
-def escape_clipped(text, budget):
-    """HTML-escape text, cutting the PLAIN text until the escaped form fits the budget.
+DRAFT_BUDGETS = {"x_post": 450, "linkedin_post": 1500}
 
-    Cutting after escaping could split an entity like &amp; and make Telegram reject
-    the message on every retry. The budget is generous because Telegram counts the text
-    after parsing entities, so the escaped length is an upper bound."""
-    out = html.escape(text, quote=False)
-    while tg_len(out) > budget:
+
+def clip(text, budget):
+    """Cut plain text to the budget, in UTF-16 units: Telegram counts the text after it
+    parses the HTML, so the budget applies to the plain text, not to the escaped form."""
+    while tg_len(text) > budget:
         text = text[: max(0, int(len(text) * 0.9) - 1)].rstrip() + "…"
-        out = html.escape(text, quote=False)
-    return out
+    return text
+
+
+def escape_clipped(text, budget):
+    """Cut the PLAIN text, then HTML-escape it. Cutting after escaping could split an
+    entity like &amp; and make Telegram reject the message on every retry."""
+    return html.escape(clip(text, budget), quote=False)
 
 
 def format_item(item):
@@ -466,11 +512,11 @@ def format_item(item):
         return f"🎬 {head}\n⚠️ Could not process: {escape_clipped(item.get('error') or '?', 500)}"
     block = f"🎬 {head}\n{escape_clipped(item['summary'], 1000)}"
     if item.get("x_post"):
-        block += f"\n\n<b>𝕏 draft</b>\n<blockquote>{escape_clipped(item['x_post'], 450)}</blockquote>"
+        block += f"\n\n<b>𝕏 draft</b>\n<blockquote>{escape_clipped(item['x_post'], DRAFT_BUDGETS['x_post'])}</blockquote>"
     if item.get("linkedin_post"):
         # Collapsed on the phone: tap to expand.
         block += ("\n<b>LinkedIn draft</b>\n<blockquote expandable>"
-                  f"{escape_clipped(item['linkedin_post'], 1500)}</blockquote>")
+                  f"{escape_clipped(item['linkedin_post'], DRAFT_BUDGETS['linkedin_post'])}</blockquote>")
     return block
 
 
