@@ -4,8 +4,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# bird (X) is in ~/.npm-global/bin; the Buffer CLI (LinkedIn) is a Node script under mise.
-Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.local/share/mise/installs/node/22.16/bin:/usr/local/bin:/usr/bin:/bin
+# bird (X) and the Buffer CLI (LinkedIn, a script run by /usr/bin/node) are in ~/.npm-global/bin.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # The bot token comes straight from the Nuc Social bot's own file; it is never copied.
 # Telegram allows ONE reader per bot: claude-telegram-bot-social.service must stay off.
 EnvironmentFile=%h/claude-telegram-bot-social/.env

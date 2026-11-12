@@ -38,7 +38,9 @@ The units read three more files and never copy them:
 - `~/.config/claude-code-token.env`: headless auth for `claude -p`, like the standup cron.
 
 They expect the checkout at `~/code/video-digest`, `grab` and `claude` in `~/.local/bin`, `bird`
-in `~/.npm-global/bin` and the Buffer CLI under mise's Node 22.16. They are systemd user units,
+and the Buffer CLI in `~/.npm-global/bin`
+(`npm install -g --prefix ~/.npm-global @bufferapp/cli`, outside mise, so a Node upgrade
+does not move it). They are systemd user units,
 not cron, because `--cookies-from-browser chrome` needs the desktop keyring over D-Bus.
 
 **One reader per bot.** Telegram gives each update to one `getUpdates` reader only. Keep

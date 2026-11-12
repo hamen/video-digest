@@ -6,7 +6,8 @@
   Telegram server and the fakes in `tests/fakes/`; they never call the real bot, grab or Claude.
 - The bot must answer only `TELEGRAM_CHAT_ID`. A change that lets another chat queue links or
   receive messages or press buttons is a security bug.
-- Secrets live in `~/.config/video-digest/env`, never in the repo.
+- Secrets stay outside the repo: the bot token in `~/claude-telegram-bot-social/.env`, the
+  Buffer keys in `~/.config/standup/buffer.env`, the chat id in `~/.config/video-digest/env`.
 - Publishing is the owner's button press only. Nothing may post on its own, and a recorded
   destination must never post twice.
 - To test against the real services, use a scratch `VD_STATE_DIR`, never the live state in
