@@ -378,12 +378,13 @@ def slop_patterns():
                 / "code/ai-slop-detector/skills/ai-slop-detector/SKILL.md")
     try:
         text = path.read_text()
-    except OSError as e:
+    except (OSError, ValueError) as e:
         raise RuntimeError(f"AI Slop Detector skill not readable: {e}") from e
-    start = text.find("## Patterns")
-    if start < 0:
-        raise RuntimeError(f"no '## Patterns' section in {path}")
-    return text[start:]
+    # From the "## Patterns" heading to the next level-2 heading; its ### groups stay in.
+    m = re.search(r"^## Patterns[ \t]*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+    if not m:
+        raise RuntimeError(f"AI Slop Detector skill: no '## Patterns' section in {path}")
+    return "## Patterns" + m.group(1)
 
 
 def summarize(folder):

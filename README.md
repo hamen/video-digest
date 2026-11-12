@@ -37,6 +37,10 @@ The units read three more files and never copy them:
   (optional; without it the LinkedIn button says so).
 - `~/.config/claude-code-token.env`: headless auth for `claude -p`, like the standup cron.
 
+Every prompt carries the pattern list of the AI Slop Detector skill, read from
+`~/code/ai-slop-detector/skills/ai-slop-detector/SKILL.md` (`VD_SLOP_FILE` overrides it); without
+that file every video fails, on purpose.
+
 They expect the checkout at `~/code/video-digest`, `grab` and `claude` in `~/.local/bin`, `bird`
 and the Buffer CLI in `~/.npm-global/bin`
 (`npm install -g --prefix ~/.npm-global @bufferapp/cli`, outside mise, so a Node upgrade
