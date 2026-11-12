@@ -1,0 +1,13 @@
+[Unit]
+Description=video-digest: download, transcribe and summarize queued links
+After=network-online.target
+
+[Service]
+Type=oneshot
+# grab, uvx, claude and stt-file live in ~/.local/bin, which the systemd PATH lacks.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/video-digest/env
+# Headless auth for `claude -p` (same file as the standup cron); optional.
+EnvironmentFile=-%h/.config/claude-code-token.env
+ExecStart=%h/code/video-digest/video-digest process
+TimeoutStartSec=2h
