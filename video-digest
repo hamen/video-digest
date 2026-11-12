@@ -74,7 +74,7 @@ title and description only, and write "none" for both posts.
 Rules for the two posts:
 - Credit the creator. Use a real name only when the title, description or uploader name states \
 it; otherwise use the uploader handle with @. Never guess who speaks in a clip.
-- Ivan's note (at the end of this prompt, after the transcript) is his own reaction to the \
+- Ivan's note (right after the transcript below) is his own reaction to the \
 video. It is the only source of his opinions and feelings. Other facts about him you may use: \
 he builds and ships indie mobile apps in public, and he has 15 years of Android experience; use \
 at most one, in passing, never as a bio line. Never invent an event, a number, a client, a \
@@ -213,7 +213,12 @@ def handle_message(msg, owner):
     text = " ".join(filter(None, [msg.get("text"), msg.get("caption")]))
     urls = [u.rstrip(").,") for u in URL_RE.findall(text)]
     # The rest of the message is Ivan's own take: the only opinion the X draft may give him.
+    # Not for a forwarded message (someone else's words), and not for several links, where
+    # nothing says which words go with which link.
     note = " ".join(URL_RE.sub(" ", text).split())[:NOTE_MAX]
+    forwarded = any(k in msg for k in ("forward_origin", "forward_from", "forward_date"))
+    if forwarded or len(set(urls)) != 1 or not re.search(r"\w", note):
+        note = ""
     if not urls:
         reply(msg, "Send me a video link (TikTok, Instagram, YouTube…). "
                    "You get a summary and post drafts in a few minutes.")

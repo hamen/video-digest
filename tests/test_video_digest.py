@@ -156,6 +156,20 @@ class VideoDigestTest(unittest.TestCase):
         self.assertEqual(one["note"], "lol this is my Monday {0}")
         self.assertNotIn("note", two)
 
+    def test_no_note_from_forwards_several_links_or_bare_punctuation(self):
+        fwd = message(1, "this is great https://youtu.be/one")
+        fwd["message"]["forward_origin"] = {"type": "user"}
+        self.tg.updates = [fwd, message(2, "skip https://youtu.be/two great https://youtu.be/three"),
+                           message(3, "(https://youtu.be/four).")]
+        self.run_tool("listen", "--once")
+        self.assertEqual(len(self.items()), 4)
+        self.assertFalse([i for i in self.items() if "note" in i])
+
+    def test_long_note_is_cut_to_the_limit(self):
+        self.tg.updates = [message(1, "https://youtu.be/one " + "a" * 1500)]
+        self.run_tool("listen", "--once")
+        self.assertEqual(self.items()[0]["note"], "a" * 1000)
+
     def test_the_note_reaches_the_prompt_and_its_absence_is_stated(self):
         self.tg.updates = [message(1, "https://youtu.be/one so true {x} FFS"),
                            message(2, "https://youtu.be/two")]
