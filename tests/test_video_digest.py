@@ -431,6 +431,12 @@ class VideoDigestTest(unittest.TestCase):
         argv = run.call_args[0][0]
         self.assertEqual(argv[argv.index("--cookies-from-browser") + 1], "chrome+gnomekeyring")
 
+    def test_process_unit_path_has_uvx_before_the_system_dirs(self):
+        unit = (ROOT / "systemd" / "video-digest-process.service").read_text()
+        path = next(l for l in unit.splitlines() if l.startswith("Environment=PATH="))
+        dirs = path.split("=", 2)[2].split(":")
+        self.assertLess(dirs.index("/home/linuxbrew/.linuxbrew/bin"), dirs.index("/usr/bin"))
+
     def test_draft_starting_with_a_dash_is_not_a_flag(self):
         item = self.ready_item()
         self.press(f"vd:{item['id']}:x")

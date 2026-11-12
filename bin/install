@@ -6,6 +6,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 env_file="$HOME/.config/video-digest/env"
 [ -f "$env_file" ] || { echo "install: $env_file missing (copy contrib/env.example)" >&2; exit 1; }
 [ -x "$HOME/code/video-digest/video-digest" ] || { echo "install: the units expect the checkout at ~/code/video-digest" >&2; exit 1; }
+[ -x /home/linuxbrew/.linuxbrew/bin/uvx ] || { echo "install: /home/linuxbrew/.linuxbrew/bin/uvx missing; the process unit puts it on PATH so grab uses the latest yt-dlp" >&2; exit 1; }
 slop="$HOME/code/ai-slop-detector/skills/ai-slop-detector/SKILL.md"
 [ -f "$slop" ] || { echo "install: $slop missing (clone FeedHive/ai-slop-detector to ~/code); every draft is checked against it" >&2; exit 1; }
 chmod 600 "$env_file"
