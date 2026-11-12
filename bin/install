@@ -12,5 +12,5 @@ for unit in "$repo"/systemd/*; do
   ln -sfn "$unit" "$HOME/.config/systemd/user/$(basename "$unit")"
 done
 systemctl --user daemon-reload
-systemctl --user enable --now video-digest-listen.service video-digest-process.timer video-digest-digest.timer
+systemctl --user enable --now video-digest-listen.service video-digest-process.timer
 systemctl --user --no-pager list-timers 'video-digest-*'

@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""video-digest: a daily Telegram digest of the videos I send to a bot.
+"""video-digest: turn the videos I send to a Telegram bot into ready-to-post drafts.
 
-  video-digest listen    long-poll the bot; queue every link that the owner sends
-  video-digest process   download + transcribe (grab) and summarize (claude -p) queued links
-  video-digest digest    send one Telegram message with every summary not sent yet
+  video-digest listen    long-poll the bot: queue the links the owner sends, start processing
+                         at once, and publish a draft when the owner presses its button
+  video-digest process   download + transcribe (grab), summarize and draft posts (claude -p),
+                         then send one message per video with publish buttons
 
-Config (environment, usually from ~/.config/video-digest/env):
-  TELEGRAM_BOT_TOKEN   token of the digest bot (from @BotFather)
-  TELEGRAM_CHAT_ID     the owner's chat: the only chat the bot listens to and writes to
+Config (environment; the systemd units load it from the files named in the README):
+  TELEGRAM_BOT_TOKEN   token of the bot
+  TELEGRAM_CHAT_ID     the owner's chat: the only chat the bot listens to, writes to and obeys
+  BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL   LinkedIn through Buffer (optional)
   VD_STATE_DIR         state and downloads (default ~/.local/state/video-digest)
   VD_GRAB              grab command (default: grab --no-video --cookies-from-browser chrome)
   VD_SUMMARIZER        summary command, prompt on stdin (default: claude -p --model sonnet)
+  VD_BIRD, VD_BUFFER   X and Buffer CLIs (default: bird and buffer on PATH)
+  VD_KICK              command listen runs after queuing (default: start the process unit)
   TELEGRAM_API         Bot API base URL (default https://api.telegram.org; tests override it)
 """
 import contextlib
 import fcntl
+import hashlib
 import html
 import json
 import os
@@ -109,7 +114,7 @@ def require(name):
 def items():
     """The item list in items.json, locked for the whole block, saved on exit.
 
-    listen, process and digest run as separate units and all write this file."""
+    listen and process run as separate units and both write this file."""
     d = state_dir()
     with open(d / "items.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -154,29 +159,133 @@ def reply(msg, text):
         log(f"reply failed: {e}")
 
 
-def handle_update(update, owner):
-    """Queue the links in one update. Returns the number of new links.
+def item_id(url):
+    return hashlib.sha1(url.encode()).hexdigest()[:10]
+
+
+def kick_processing():
+    """Start processing now, so a draft arrives minutes after the link, not at the next tick.
+
+    Fire and forget: the timer still runs every 10 minutes and catches anything missed."""
+    cmd = os.environ.get("VD_KICK", "systemctl --user start --no-block video-digest-process.service")
+    if not cmd:
+        return
+    try:
+        subprocess.Popen(shlex.split(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        log(f"could not start processing: {e}")
+
+
+def handle_message(msg, owner):
+    """Queue the links in one message. Returns the number of new links.
 
     A storage error propagates, so listen does not ack the update and Telegram resends it."""
-    msg = update.get("message") or {}
     if str(msg.get("chat", {}).get("id")) != owner:
         return 0  # only the owner's chat; strangers who find the bot get nothing
     text = " ".join(filter(None, [msg.get("text"), msg.get("caption")]))
     urls = [u.rstrip(").,") for u in URL_RE.findall(text)]
     if not urls:
         reply(msg, "Send me a video link (TikTok, Instagram, YouTube…). "
-                   "It goes in tomorrow's digest.")
+                   "You get a summary and post drafts in a few minutes.")
         return 0
     with items() as data:
         known = {i["url"] for i in data}
         new = [u for u in dict.fromkeys(urls) if u not in known]
         for u in new:
-            data.append({"url": u, "received_at": now(), "status": "queued", "attempts": 0})
+            data.append({"id": item_id(u), "url": u, "received_at": now(), "status": "queued",
+                         "attempts": 0})
     if new:
-        reply(msg, f"Queued {len(new)} link{'s' if len(new) > 1 else ''}.")
+        reply(msg, f"Queued {len(new)} link{'s' if len(new) > 1 else ''}. Drafts in a few minutes.")
+        kick_processing()
     else:
         reply(msg, "Already queued.")
     return len(new)
+
+
+def answer(cb, text):
+    """The toast on the button. Cosmetic: an expired callback id must not stop the post."""
+    try:
+        telegram("answerCallbackQuery", callback_query_id=cb["id"], text=text)
+    except (OSError, RuntimeError, ValueError) as e:
+        log(f"could not answer the button press: {e}")
+
+
+TARGETS = {"x": ["x"], "li": ["linkedin"], "both": ["x", "linkedin"]}
+
+
+def handle_callback(cb, owner):
+    """Publish the drafts of one item when the owner presses a button.
+
+    Each destination is recorded the moment it succeeds, so a second press, or a press
+    after a partial failure, never posts the same draft twice."""
+    if str(cb.get("from", {}).get("id")) != owner:
+        answer(cb, "Not allowed.")
+        return
+    parts = (cb.get("data") or "").split(":")
+    if len(parts) != 3 or parts[0] != "vd" or parts[2] not in TARGETS:
+        answer(cb, "Unknown button.")
+        return
+    with items() as data:
+        item = next((dict(i) for i in data if i.get("id") == parts[1]), None)
+    if not item:
+        answer(cb, "That video is no longer in the list.")
+        return
+    answer(cb, "Posting…")
+    lines = []
+    for dest in TARGETS[parts[2]]:
+        name, key, flag = (("X", "x_post", "posted_x") if dest == "x"
+                           else ("LinkedIn", "linkedin_post", "posted_linkedin"))
+        if item.get(flag):
+            lines.append(f"✓ {name}: already posted, skipped")
+            continue
+        if not item.get(key):
+            lines.append(f"✗ {name}: no draft for this video")
+            continue
+        ok, detail = post_x(item[key]) if dest == "x" else post_linkedin(item[key])
+        if ok:
+            with items() as data:
+                for i in data:
+                    if i.get("id") == item["id"]:
+                        i[flag] = now()
+        lines.append(f"{'✓' if ok else '✗'} {name}: {'posted' if ok else detail}")
+    log(f"[{item['id']}] " + " | ".join(lines))
+    try:
+        send("\n".join(lines), reply_to_message_id=item.get("message_id"))
+    except (OSError, RuntimeError, ValueError) as e:
+        log(f"could not report the result: {e}")
+
+
+def handle_update(update, owner):
+    if update.get("callback_query"):
+        handle_callback(update["callback_query"], owner)
+    elif update.get("message"):
+        handle_message(update["message"], owner)
+
+
+# ---------------------------------------------------------------- publish
+
+def run_cli(cmd, env=None):
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)[:300]
+    if res.returncode != 0:
+        return False, (res.stderr or res.stdout).strip()[:300] or f"exit {res.returncode}"
+    return True, res.stdout.strip()[:300]
+
+
+def post_x(text):
+    return run_cli(shlex.split(os.environ.get("VD_BIRD", "bird")) + ["tweet", text])
+
+
+def post_linkedin(text):
+    """Through the Buffer CLI, like the standup: shareNow, because the press is the approval."""
+    key, channel = os.environ.get("BUFFER_API_KEY"), os.environ.get("BUFFER_LINKEDIN_CHANNEL")
+    if not key or not channel:
+        return False, "Buffer is not configured (BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL)"
+    return run_cli(shlex.split(os.environ.get("VD_BUFFER", "buffer")) + [
+        "posts", "create", "--channel-id", channel, "--text", text,
+        "--mode", "shareNow", "--scheduling-type", "automatic"])
 
 
 def cmd_listen(once=False):
@@ -188,7 +297,8 @@ def cmd_listen(once=False):
         try:
             # Long poll: Telegram holds the request up to 30 s; the HTTP timeout is longer.
             updates = telegram("getUpdates", http_timeout=45, offset=offset,
-                               timeout=0 if once else 30, allowed_updates=["message"])
+                               timeout=0 if once else 30,
+                               allowed_updates=["message", "callback_query"])
         except (OSError, RuntimeError, ValueError) as e:
             log(f"getUpdates failed: {e}")
             if once:
@@ -237,7 +347,7 @@ def parse_sections(text):
     """Split the summarizer output into summary and the two post drafts.
 
     Output without the markers is kept whole as the summary, so a model that ignores
-    the format still produces a digest entry. "none" means no draft."""
+    the format still produces a message. "none" means no draft."""
     parts = SECTION_RE.split(text)
     if len(parts) < 3:
         return {"summary": text.strip(), "x_post": "", "linkedin_post": ""}
@@ -284,10 +394,48 @@ def cmd_process():
                 if item["attempts"] >= MAX_ATTEMPTS:
                     item.update(status="failed", processed_at=now())
                 log(f"failed ({item['attempts']}/{MAX_ATTEMPTS}): {url}: {error}")
+        notify_pending()
+    notify_pending()
     return 0
 
 
-# ---------------------------------------------------------------- digest
+def keyboard(item):
+    row = []
+    if item.get("x_post"):
+        row.append({"text": "Post on 𝕏", "callback_data": f"vd:{item['id']}:x"})
+    if item.get("linkedin_post"):
+        row.append({"text": "Post on LinkedIn", "callback_data": f"vd:{item['id']}:li"})
+    if len(row) == 2:
+        row.append({"text": "Both", "callback_data": f"vd:{item['id']}:both"})
+    return {"inline_keyboard": [row]} if row else None
+
+
+def notify_pending():
+    """Send one message per processed video that has not been sent yet.
+
+    A failed send leaves the item unsent, and the next process run tries again."""
+    with items() as data:
+        ready = [dict(i) for i in data
+                 if i["status"] in ("done", "failed") and not i.get("message_id")]
+    for item in ready:
+        if "id" not in item:
+            item["id"] = item_id(item["url"])
+        extra = {}
+        markup = keyboard(item) if item["status"] == "done" else None
+        if markup:
+            extra["reply_markup"] = markup
+        try:
+            msg = send(format_item(item), parse_mode="HTML", **extra)
+        except (OSError, RuntimeError, ValueError) as e:
+            log(f"could not send {item['url']}: {e}")
+            continue
+        with items() as data:
+            for i in data:
+                if i["url"] == item["url"]:
+                    i.update(id=item["id"], message_id=msg.get("message_id"), notified_at=now())
+
+
+# ---------------------------------------------------------------- message
 
 def tg_len(text):
     """Length as Telegram counts it: UTF-16 code units (an emoji counts 2)."""
@@ -315,8 +463,8 @@ def format_item(item):
     head = (f'<b><a href="{html.escape(url, quote=True)}">{title}</a></b>{who}'
             if len(url) <= 300 else f"<b>{title}</b>{who}")
     if item["status"] == "failed":
-        return f"{head}\n⚠️ Could not process: {escape_clipped(item.get('error') or '?', 500)}"
-    block = f"{head}\n{escape_clipped(item['summary'], 1000)}"
+        return f"🎬 {head}\n⚠️ Could not process: {escape_clipped(item.get('error') or '?', 500)}"
+    block = f"🎬 {head}\n{escape_clipped(item['summary'], 1000)}"
     if item.get("x_post"):
         block += f"\n\n<b>𝕏 draft</b>\n<blockquote>{escape_clipped(item['x_post'], 450)}</blockquote>"
     if item.get("linkedin_post"):
@@ -326,52 +474,13 @@ def format_item(item):
     return block
 
 
-def split_messages(header, blocks, limit=TELEGRAM_LIMIT):
-    """Pack blocks into messages under the limit. Returns [(text, [block indexes])].
-
-    format_item caps every block well under the limit, so a block is never cut."""
-    packs, text, idx = [], header, []
-    for n, block in enumerate(blocks):
-        if idx and tg_len(text) + 2 + tg_len(block) > limit:
-            packs.append((text, idx))
-            text, idx = header, []
-        text += "\n\n" + block
-        idx.append(n)
-    packs.append((text, idx))
-    return packs
-
-
-def cmd_digest():
-    with items() as data:
-        ready = [dict(i) for i in data
-                 if i["status"] in ("done", "failed") and not i.get("digested_at")]
-    if not ready:
-        log("nothing to send")
-        return 0
-    day = datetime.now().strftime("%a %d %b")
-    n = len(ready)
-    header = f"🎬 <b>Video digest · {day}</b> · {n} video{'s' if n > 1 else ''}"
-    # Send outside the lock (listen and process keep working), and stamp each message's
-    # items right after Telegram accepts it: a later failure must not resend earlier parts.
-    for text, idx in split_messages(header, [format_item(i) for i in ready]):
-        send(text, parse_mode="HTML")
-        sent_urls = {ready[k]["url"] for k in idx}
-        with items() as data:
-            for i in data:
-                if i["url"] in sent_urls:
-                    i["digested_at"] = now()
-    log(f"sent {n} items")
-    return 0
-
-
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("listen", "process", "digest"):
+    if len(argv) < 2 or argv[1] not in ("listen", "process"):
         print(__doc__, file=sys.stderr)
         return 2
-    cmd = argv[1]
-    if cmd == "listen":
+    if argv[1] == "listen":
         return cmd_listen(once="--once" in argv)
-    return cmd_process() if cmd == "process" else cmd_digest()
+    return cmd_process()
 
 
 if __name__ == "__main__":

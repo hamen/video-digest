@@ -1,5 +1,5 @@
 [Unit]
-Description=video-digest: process queued links every 10 minutes
+Description=video-digest: retry queued links and unsent messages every 10 minutes
 
 [Timer]
 OnCalendar=*:0/10

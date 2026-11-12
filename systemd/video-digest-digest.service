@@ -1,9 +1,0 @@
-[Unit]
-Description=video-digest: send the daily digest to Telegram
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-EnvironmentFile=%h/.config/video-digest/env
-ExecStart=%h/code/video-digest/video-digest digest

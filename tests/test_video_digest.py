@@ -54,7 +54,8 @@ class FakeTelegram:
                         and len([c for c in fake.calls if c[0] == "sendMessage"]) > fake.fail_send_from:
                     result = {"ok": False, "description": "Bad Request: can't parse entities"}
                 else:
-                    result = {"ok": True, "result": {"message_id": 1}}
+                    fake.next_id += 1
+                    result = {"ok": True, "result": {"message_id": fake.next_id}}
                 data = json.dumps(result).encode()
                 self.send_response(200 if result["ok"] else 400)
                 self.send_header("Content-Length", str(len(data)))
@@ -62,6 +63,7 @@ class FakeTelegram:
                 self.wfile.write(data)
 
         self.fail_send_from = None
+        self.next_id = 100
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_port}"
@@ -91,7 +93,11 @@ class VideoDigestTest(unittest.TestCase):
                         TELEGRAM_CHAT_ID=OWNER, VD_STATE_DIR=str(self.tmp / "state"),
                         FAKE_LOG=str(self.log),
                         VD_GRAB=f"{sys.executable} {FAKES / 'fake_grab.py'}",
-                        VD_SUMMARIZER=f"{sys.executable} {FAKES / 'fake_summarizer.py'}")
+                        VD_SUMMARIZER=f"{sys.executable} {FAKES / 'fake_summarizer.py'}",
+                        VD_BIRD=f"{sys.executable} {FAKES / 'fake_poster.py'} bird",
+                        VD_BUFFER=f"{sys.executable} {FAKES / 'fake_poster.py'} buffer",
+                        BUFFER_API_KEY="bk", BUFFER_LINKEDIN_CHANNEL="chan",
+                        VD_KICK=f"touch {self.tmp / 'kicked'}")
 
     def run_tool(self, *args, **env):
         return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True,
@@ -122,7 +128,7 @@ class VideoDigestTest(unittest.TestCase):
         sent = self.tg.sent()
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["chat_id"], OWNER)
-        self.assertEqual(sent[0]["text"], "Queued 2 links.")
+        self.assertEqual(sent[0]["text"], "Queued 2 links. Drafts in a few minutes.")
         self.assertEqual((self.tmp / "state" / "telegram-offset").read_text(), "3")
 
     def test_listen_does_not_queue_a_link_twice(self):
@@ -192,62 +198,6 @@ class VideoDigestTest(unittest.TestCase):
         self.run_tool("process")
         self.assertEqual(self.log.read_text().count("grab "), 1)
 
-    # ---- digest
-
-    def test_digest_sends_done_and_failed_once(self):
-        self.queue("https://youtu.be/one?title=A%3Cb%3E%26c", "https://youtu.be/bad?mode=fail")
-        self.run_tool("process")
-        self.run_tool("process")
-        r = self.run_tool("digest")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        sent = self.tg.sent()
-        self.assertEqual(len(sent), 1)
-        text = sent[0]["text"]
-        self.assertEqual(sent[0]["parse_mode"], "HTML")
-        self.assertIn("2 videos", text)
-        self.assertIn("A&lt;b&gt;&amp;c", text)  # the title is escaped for HTML
-        self.assertIn("Could not process", text)
-        self.assertTrue(all(i.get("digested_at") for i in self.items()))
-        self.tg.calls.clear()
-        self.run_tool("digest")
-        self.assertEqual(self.tg.sent(), [])
-
-    def test_digest_skips_items_still_queued(self):
-        self.queue("https://youtu.be/one")
-        r = self.run_tool("digest")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.tg.sent(), [])
-        self.assertIsNone(self.items()[0].get("digested_at"))
-
-    def test_failed_send_leaves_items_for_the_next_digest(self):
-        self.queue("https://youtu.be/one")
-        self.run_tool("process")
-        self.tg.fail_send_from = 0
-        r = self.run_tool("digest")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIsNone(self.items()[0].get("digested_at"))
-
-    def test_second_message_failure_does_not_resend_the_first(self):
-        long = "https://youtu.be/{n}?title=" + "T" * 290
-        self.queue(*[long.format(n=n) for n in range(12)])
-        items = self.items()
-        for i in items:  # done items with a long summary each, so the digest needs 2+ messages
-            i.update(status="done", title="T" * 290, uploader="u", summary="s" * 2900)
-        (self.tmp / "state" / "items.json").write_text(json.dumps(items))
-        self.tg.fail_send_from = 1
-        r = self.run_tool("digest")
-        self.assertNotEqual(r.returncode, 0)
-        stamped = [i for i in self.items() if i.get("digested_at")]
-        self.assertGreater(len(stamped), 0)
-        self.assertLess(len(stamped), 12)
-        self.tg.fail_send_from = None
-        self.tg.calls.clear()
-        self.run_tool("digest")
-        resent = "".join(b["text"] for b in self.tg.sent())
-        first_url = stamped[0]["url"]
-        self.assertNotIn(first_url.replace("&", "&amp;"), resent)
-        self.assertTrue(all(i.get("digested_at") for i in self.items()))
-
     def test_storage_failure_does_not_ack_the_update(self):
         state = self.tmp / "state"
         state.mkdir(parents=True)
@@ -291,14 +241,13 @@ class VideoDigestTest(unittest.TestCase):
         self.assertIn("timed out", slow["error"])
         self.assertEqual(two["status"], "done")
 
-    def test_drafts_reach_the_digest(self):
+    def test_drafts_reach_the_message(self):
         self.queue("https://youtu.be/one?title=Funnels")
         self.run_tool("process", FAKE_SUM="sections")
         item = self.items()[0]
         self.assertEqual(item["summary"], "About Funnels.\n- a claim\nAction: try it")
         self.assertEqual(item["x_post"], "Post about Funnels")
         self.assertEqual(item["linkedin_post"], "Longer post about Funnels.\n\nSecond paragraph.")
-        self.run_tool("digest")
         text = self.tg.sent()[0]["text"]
         self.assertIn("<blockquote>Post about Funnels</blockquote>", text)
         self.assertIn("<blockquote expandable>Longer post about Funnels.", text)
@@ -306,15 +255,144 @@ class VideoDigestTest(unittest.TestCase):
         self.assertIn("Never invent an event", prompt)
         self.assertIn("No em dashes", prompt)
 
-    # ---- message packing
+    # ---- real-time messages
 
-    def test_split_messages_stays_under_the_limit(self):
-        mod = load_module()
-        blocks = [f"block {n} " + "x" * 900 for n in range(10)]
-        packs = mod.split_messages("HEAD 🎬", blocks, limit=4096)
-        self.assertGreater(len(packs), 1)
-        self.assertTrue(all(mod.tg_len(text) <= 4096 for text, _ in packs))
-        self.assertEqual(sorted(k for _, idx in packs for k in idx), list(range(10)))
+    def test_each_video_gets_its_own_message_with_buttons(self):
+        self.queue("https://youtu.be/one?title=One", "https://youtu.be/two?title=Two")
+        r = self.run_tool("process", FAKE_SUM="sections")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sent = self.tg.sent()
+        self.assertEqual(len(sent), 2)
+        self.assertIn("One", sent[0]["text"])
+        self.assertIn("Two", sent[1]["text"])
+        row = sent[0]["reply_markup"]["inline_keyboard"][0]
+        item = self.items()[0]
+        self.assertEqual([b["callback_data"] for b in row],
+                         [f"vd:{item['id']}:x", f"vd:{item['id']}:li", f"vd:{item['id']}:both"])
+        self.assertTrue(all(i.get("message_id") for i in self.items()))
+        self.tg.calls.clear()
+        self.run_tool("process")
+        self.assertEqual(self.tg.sent(), [])  # never sent twice
+
+    def test_failed_video_message_has_no_buttons(self):
+        self.queue("https://youtu.be/bad?mode=fail")
+        self.run_tool("process")
+        self.assertEqual(self.tg.sent(), [])  # first failure: retry later, say nothing yet
+        self.run_tool("process")
+        sent = self.tg.sent()
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Could not process", sent[0]["text"])
+        self.assertNotIn("reply_markup", sent[0])
+
+    def test_video_without_drafts_has_no_buttons(self):
+        self.queue("https://youtu.be/one")
+        self.run_tool("process")  # plain summary, no sections: no drafts
+        self.assertNotIn("reply_markup", self.tg.sent()[0])
+
+    def test_unsent_message_is_retried_on_the_next_run(self):
+        self.queue("https://youtu.be/one")
+        self.tg.fail_send_from = 0
+        self.run_tool("process")
+        self.assertIsNone(self.items()[0].get("message_id"))
+        self.tg.fail_send_from = None
+        self.run_tool("process")
+        self.assertIsNotNone(self.items()[0].get("message_id"))
+
+    def test_queuing_starts_processing_right_away(self):
+        self.queue("https://youtu.be/one")
+        self.assertTrue((self.tmp / "kicked").exists())
+
+    def test_duplicate_link_does_not_start_processing(self):
+        self.queue("https://youtu.be/one")
+        (self.tmp / "kicked").unlink()
+        self.tg.updates = [message(9, "https://youtu.be/one")]
+        self.run_tool("listen", "--once")
+        self.assertFalse((self.tmp / "kicked").exists())
+
+    # ---- buttons
+
+    def press(self, data, who=OWNER, update_id=50):
+        self.tg.updates = [{"update_id": update_id, "callback_query": {
+            "id": f"cb{update_id}", "from": {"id": int(who)}, "data": data,
+            "message": {"message_id": 1, "chat": {"id": int(who)}}}}]
+        self.tg.calls.clear()
+        r = self.run_tool("listen", "--once")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def posts(self):
+        return [l for l in self.log.read_text().splitlines() if l.startswith("post ")]
+
+    def ready_item(self):
+        self.queue("https://youtu.be/one?title=One")
+        self.run_tool("process", FAKE_SUM="sections")
+        return self.items()[0]
+
+    def test_x_button_posts_the_x_draft_once(self):
+        item = self.ready_item()
+        self.press(f"vd:{item['id']}:x")
+        self.assertEqual(self.posts(), ['post bird ["tweet", "Post about One"]'])
+        self.assertTrue(self.items()[0].get("posted_x"))
+        report = self.tg.sent()[0]
+        self.assertEqual(report["text"], "✓ X: posted")
+        self.assertEqual(report["reply_to_message_id"], item["message_id"])
+        self.press(f"vd:{item['id']}:x", update_id=51)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertIn("already posted", self.tg.sent()[0]["text"])
+
+    def test_linkedin_button_uses_buffer_share_now(self):
+        item = self.ready_item()
+        self.press(f"vd:{item['id']}:li")
+        (line,) = self.posts()
+        self.assertTrue(line.startswith("post buffer "))
+        argv = json.loads(line[len("post buffer "):])
+        self.assertEqual(argv[argv.index("--mode") + 1], "shareNow")
+        self.assertEqual(argv[argv.index("--channel-id") + 1], "chan")
+        self.assertTrue(argv[argv.index("--text") + 1].startswith("Longer post about One."))
+
+    def test_both_after_x_posts_only_linkedin(self):
+        item = self.ready_item()
+        self.press(f"vd:{item['id']}:x")
+        self.press(f"vd:{item['id']}:both", update_id=51)
+        self.assertEqual([l.split()[1] for l in self.posts()], ["bird", "buffer"])
+        self.assertIn("X: already posted", self.tg.sent()[0]["text"])
+
+    def test_refused_post_reports_the_reason(self):
+        item = self.ready_item()
+        self.tg.updates = [{"update_id": 60, "callback_query": {
+            "id": "cb60", "from": {"id": int(OWNER)}, "data": f"vd:{item['id']}:x",
+            "message": {"message_id": 1, "chat": {"id": int(OWNER)}}}}]
+        self.run_tool("listen", "--once", FAKE_POST_FAIL="bird")
+        self.assertIsNone(self.items()[0].get("posted_x"))
+        self.assertIn("✗ X: bird: refused", self.tg.sent()[-1]["text"])
+        self.press(f"vd:{item['id']}:x", update_id=61)
+        self.assertTrue(self.items()[0].get("posted_x"))
+        self.assertEqual(len(self.posts()), 2)
+
+    def test_linkedin_without_buffer_config_says_so(self):
+        item = self.ready_item()
+        self.tg.updates = [{"update_id": 70, "callback_query": {
+            "id": "cb70", "from": {"id": int(OWNER)}, "data": f"vd:{item['id']}:both",
+            "message": {"message_id": 1, "chat": {"id": int(OWNER)}}}}]
+        self.tg.calls.clear()
+        self.run_tool("listen", "--once", BUFFER_API_KEY="")
+        text = self.tg.sent()[0]["text"]
+        self.assertIn("✓ X: posted", text)
+        self.assertIn("Buffer is not configured", text)
+
+    def test_stranger_cannot_press_the_buttons(self):
+        item = self.ready_item()
+        self.press(f"vd:{item['id']}:both", who="999")
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.tg.sent(), [])
+        self.assertEqual(self.tg.calls[-1][0], "answerCallbackQuery")
+
+    def test_unknown_button_data_posts_nothing(self):
+        self.ready_item()
+        self.press("vd:nope:x")
+        self.press("something:else", update_id=51)
+        self.assertEqual(self.posts(), [])
+
+    # ---- message packing
 
     def test_long_html_title_is_clipped_before_escaping(self):
         mod = load_module()
@@ -339,9 +417,7 @@ class VideoDigestTest(unittest.TestCase):
         item = {"url": "https://x.example/" + "p" * 280, "status": "done", "uploader": "&" * 500,
                 "title": "&" * 2000, "summary": "&" * 5000, "x_post": "&" * 5000,
                 "linkedin_post": "&" * 5000}
-        header = "🎬 <b>Video digest · Thu 12 Nov</b> · 99 videos"
-        (text, idx), = mod.split_messages(header, [mod.format_item(item)])
-        self.assertLessEqual(mod.tg_len(text), 4096)
+        self.assertLessEqual(mod.tg_len(mod.format_item(item)), 4096)
 
     def test_tg_len_counts_emoji_as_two(self):
         mod = load_module()
