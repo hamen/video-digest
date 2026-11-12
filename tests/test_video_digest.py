@@ -148,6 +148,26 @@ class VideoDigestTest(unittest.TestCase):
         self.assertEqual(len(self.items()), 1)
         self.assertEqual(self.tg.sent()[0]["text"], "Already queued.")
 
+    def test_listen_keeps_the_words_around_the_link_as_the_note(self):
+        self.tg.updates = [message(1, "lol this is my Monday {0} https://youtu.be/one"),
+                           message(2, "https://youtu.be/two")]
+        self.run_tool("listen", "--once")
+        one, two = self.items()
+        self.assertEqual(one["note"], "lol this is my Monday {0}")
+        self.assertNotIn("note", two)
+
+    def test_the_note_reaches_the_prompt_and_its_absence_is_stated(self):
+        self.tg.updates = [message(1, "https://youtu.be/one so true {x} FFS"),
+                           message(2, "https://youtu.be/two")]
+        self.run_tool("listen", "--once")
+        r = self.run_tool("process")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        one, two = [l for l in self.log.read_text().splitlines() if l.startswith("prompt ")]
+        self.assertIn("note on this video (his own words):\\nso true {x} FFS", one)
+        self.assertNotIn("note on this video: none.", one)
+        self.assertIn("note on this video: none.", two)
+        self.assertEqual([i["status"] for i in self.items()], ["done", "done"])
+
     def test_listen_answers_a_message_without_links(self):
         self.tg.updates = [message(1, "hello")]
         self.run_tool("listen", "--once")
