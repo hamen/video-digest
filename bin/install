@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Link the systemd user units from this checkout and start them.
+# Needs ~/.config/video-digest/env (see contrib/env.example) and grab on PATH.
+set -euo pipefail
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+env_file="$HOME/.config/video-digest/env"
+[ -f "$env_file" ] || { echo "install: $env_file missing (copy contrib/env.example)" >&2; exit 1; }
+[ -x "$HOME/code/video-digest/video-digest" ] || { echo "install: the units expect the checkout at ~/code/video-digest" >&2; exit 1; }
+chmod 600 "$env_file"
+mkdir -p "$HOME/.config/systemd/user"
+for unit in "$repo"/systemd/*; do
+  ln -sfn "$unit" "$HOME/.config/systemd/user/$(basename "$unit")"
+done
+systemctl --user daemon-reload
+systemctl --user enable --now video-digest-listen.service video-digest-process.timer
+systemctl --user --no-pager list-timers 'video-digest-*'

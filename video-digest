@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""video-digest: turn the videos I send to a Telegram bot into ready-to-post drafts.
+
+  video-digest listen    long-poll the bot: queue the links the owner sends, start processing
+                         at once, and publish a draft when the owner presses its button
+  video-digest process   download + transcribe (grab), summarize and draft posts (claude -p),
+                         then send one message per video with publish buttons
+
+Config (environment; the systemd units load it from the files named in the README):
+  TELEGRAM_BOT_TOKEN   token of the bot
+  TELEGRAM_CHAT_ID     the owner's chat: the only chat the bot listens to, writes to and obeys
+  BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL   LinkedIn through Buffer (optional)
+  VD_STATE_DIR         state and downloads (default ~/.local/state/video-digest)
+  VD_GRAB              grab command (default: grab --no-video --cookies-from-browser chrome)
+  VD_SUMMARIZER        summary command, prompt on stdin (default: claude -p --model sonnet)
+  VD_BIRD, VD_BUFFER   X and Buffer CLIs (default: bird and buffer on PATH)
+  VD_KICK              command listen runs after queuing (default: start the process unit)
+  TELEGRAM_API         Bot API base URL (default https://api.telegram.org; tests override it)
+"""
+import contextlib
+import fcntl
+import hashlib
+import html
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+URL_RE = re.compile(r"https?://[^\s<>\"']+")
+MAX_ATTEMPTS = 2
+TELEGRAM_LIMIT = 4096  # per message, counted in UTF-16 code units after entity parsing
+SUMMARY_TIMEOUT = 300
+GRAB_TIMEOUT = 1800
+
+PROMPT = """You work for Ivan, an Android and Flutter developer with 15 years of experience who \
+builds and ships a portfolio of indie mobile apps in public. Below are the metadata and the \
+transcript of a short video he liked (speech-to-text, so expect misheard words and no punctuation).
+
+Write three sections in English, with these exact marker lines. Output nothing before the first \
+marker and nothing after the LinkedIn post: no notes, no checks, no comments. Everything you \
+write goes straight into a Telegram message.
+
+SUMMARY:
+<one line: what the video is about, and who says it>
+- <2 to 4 lines: the concrete claims, techniques or numbers from the video>
+Action: <one concrete thing Ivan could try this week, or "none" if nothing applies>
+
+X POST:
+<a post for Ivan's X account, at most 270 characters, no link>
+
+LINKEDIN POST:
+<a post for Ivan's LinkedIn, 60 to 150 words, in 2 or 3 short paragraphs>
+
+Rules for all sections:
+- Use only what the transcript and metadata say. Do not invent numbers, names, quotes or claims.
+- If the transcript is empty, start the summary with "No speech in this video.", summarize the \
+title and description only, and write "none" for both posts.
+
+Rules for the two posts:
+- Credit the creator. Use a real name only when the title, description or uploader name states \
+it; otherwise use the uploader handle with @. Never guess who speaks in a clip.
+- Ivan's own angle may use only these facts: he builds and ships indie mobile apps in public, \
+and he has 15 years of Android experience. Use at most one of them, in passing, and only where it \
+connects to the point; never restate them as a bio line. Never invent an event, a number, a \
+client, a story, a plan or a feeling about him.
+- Plain, direct sentences. No em dashes, no hashtags, no emoji, no exclamation marks.
+- Never use: "here's the thing", "the truth is", "let that sink in", "game changer", "unlock", \
+"leverage", "delve", "journey", "it's not X, it's Y", "I keep thinking about", "the part I \
+liked", a question that you answer yourself, a closing question like "Thoughts?" or "Agree?", \
+one sentence per line, thread markers.
+- Write "none" for both posts if the video has nothing worth sharing.
+
+Title: {title}
+Uploader: {uploader}
+Duration: {duration} s
+Description: {description}
+
+Transcript:
+{transcript}
+"""
+
+
+def log(msg):
+    print(f"{datetime.now().isoformat(timespec='seconds')} {msg}", file=sys.stderr, flush=True)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def state_dir():
+    d = Path(os.environ.get("VD_STATE_DIR", Path.home() / ".local/state/video-digest"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def require(name):
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"video-digest: {name} is not set")
+    return value
+
+
+# ---------------------------------------------------------------- state
+
+@contextlib.contextmanager
+def items():
+    """The item list in items.json, locked for the whole block, saved on exit.
+
+    listen and process run as separate units and both write this file."""
+    d = state_dir()
+    with open(d / "items.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = d / "items.json"
+        data = json.loads(path.read_text()) if path.exists() else []
+        yield data
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(path)
+
+
+# ---------------------------------------------------------------- telegram
+
+def telegram(method, http_timeout=40, **params):
+    token = require("TELEGRAM_BOT_TOKEN")
+    base = os.environ.get("TELEGRAM_API", "https://api.telegram.org").rstrip("/")
+    req = urllib.request.Request(
+        f"{base}/bot{token}/{method}", data=json.dumps(params).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read() or b"{}")
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram {method}: {body.get('description', 'no description')}")
+    return body["result"]
+
+
+def send(text, **extra):
+    return telegram("sendMessage", chat_id=require("TELEGRAM_CHAT_ID"), text=text,
+                    disable_web_page_preview=True, **extra)
+
+
+# ---------------------------------------------------------------- listen
+
+def reply(msg, text):
+    """Best effort: a lost "Queued" reply must not cost the link, which is already saved."""
+    try:
+        send(text, reply_to_message_id=msg.get("message_id"))
+    except (OSError, RuntimeError, ValueError) as e:
+        log(f"reply failed: {e}")
+
+
+def item_id(url):
+    return hashlib.sha1(url.encode()).hexdigest()[:10]
+
+
+def kick_processing():
+    """Start processing now, so a draft arrives minutes after the link, not at the next tick.
+
+    Fire and forget: the timer still runs every 10 minutes and catches anything missed."""
+    cmd = os.environ.get("VD_KICK", "systemctl --user start --no-block video-digest-process.service")
+    if not cmd:
+        return
+    try:
+        # --no-block returns at once; run() also reaps the child, Popen would leave a zombie.
+        subprocess.run(shlex.split(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"could not start processing: {e}")
+
+
+def handle_message(msg, owner):
+    """Queue the links in one message. Returns the number of new links.
+
+    A storage error propagates, so listen does not ack the update and Telegram resends it."""
+    if str(msg.get("chat", {}).get("id")) != owner:
+        return 0  # only the owner's chat; strangers who find the bot get nothing
+    text = " ".join(filter(None, [msg.get("text"), msg.get("caption")]))
+    urls = [u.rstrip(").,") for u in URL_RE.findall(text)]
+    if not urls:
+        reply(msg, "Send me a video link (TikTok, Instagram, YouTube…). "
+                   "You get a summary and post drafts in a few minutes.")
+        return 0
+    with items() as data:
+        known = {i["url"] for i in data}
+        new = [u for u in dict.fromkeys(urls) if u not in known]
+        for u in new:
+            data.append({"id": item_id(u), "url": u, "received_at": now(), "status": "queued",
+                         "attempts": 0})
+    if new:
+        reply(msg, f"Queued {len(new)} link{'s' if len(new) > 1 else ''}. Drafts in a few minutes.")
+        kick_processing()
+    else:
+        reply(msg, "Already queued.")
+    return len(new)
+
+
+def answer(cb, text):
+    """The toast on the button. Cosmetic: an expired callback id must not stop the post."""
+    try:
+        telegram("answerCallbackQuery", callback_query_id=cb["id"], text=text)
+    except (OSError, RuntimeError, ValueError) as e:
+        log(f"could not answer the button press: {e}")
+
+
+TARGETS = {"x": ["x"], "li": ["linkedin"], "both": ["x", "linkedin"]}
+DESTS = {"x": ("X", "x_post", "posted_x", "posting_x"),
+         "linkedin": ("LinkedIn", "linkedin_post", "posted_linkedin", "posting_linkedin")}
+
+
+def update_item(item_id_, **fields):
+    with items() as data:
+        for i in data:
+            if i.get("id") == item_id_:
+                i.update(fields)
+                for k in [k for k, v in fields.items() if v is None]:
+                    i.pop(k)
+
+
+def claim(item_id_, dest):
+    """Under the lock: check the destination and record the attempt BEFORE posting.
+
+    Returns (draft, None) when this press may post, or (None, reason) when it may not.
+    The attempt mark stays when the result is unknown (a crash, or a failed save after a
+    successful post), so a resent update or a second listener never posts twice."""
+    name, key, flag, attempt = DESTS[dest]
+    with items() as data:
+        item = next((i for i in data if i.get("id") == item_id_), None)
+        if item is None:
+            return None, f"✗ {name}: the video is no longer in the list"
+        if item.get(flag):
+            return None, f"✓ {name}: already posted, skipped"
+        if item.get(attempt):
+            return None, (f"? {name}: an earlier attempt ({item[attempt]}) did not finish. "
+                          f"Check {name}; not retried")
+        if not item.get(key):
+            return None, f"✗ {name}: no draft for this video"
+        item[attempt] = now()
+        return item[key], None
+
+
+def handle_callback(cb, owner):
+    """Publish the drafts of one item when the owner presses a button.
+
+    Each destination is recorded the moment it succeeds, so a second press, or a press
+    after a partial failure, never posts the same draft twice."""
+    if str(cb.get("from", {}).get("id")) != owner:
+        answer(cb, "Not allowed.")
+        return
+    parts = (cb.get("data") or "").split(":")
+    if len(parts) != 3 or parts[0] != "vd" or parts[2] not in TARGETS:
+        answer(cb, "Unknown button.")
+        return
+    with items() as data:
+        item = next((dict(i) for i in data if i.get("id") == parts[1]), None)
+    if not item:
+        answer(cb, "That video is no longer in the list.")
+        return
+    answer(cb, "Posting…")
+    lines = []
+    for dest in TARGETS[parts[2]]:
+        name, _, flag, attempt = DESTS[dest]
+        text, reason = claim(item["id"], dest)
+        if reason:
+            lines.append(reason)
+            continue
+        status, detail = post_x(text) if dest == "x" else post_linkedin(text)
+        # Only a clear refusal clears the attempt mark. A timeout keeps it, and a failed
+        # save here propagates with the mark still set: either way, no repost.
+        if status == "ok":
+            update_item(item["id"], **{flag: now(), attempt: None})
+            lines.append(f"✓ {name}: posted")
+        elif status == "failed":
+            update_item(item["id"], **{attempt: None})
+            lines.append(f"✗ {name}: {detail}")
+        else:
+            lines.append(f"? {name}: {detail}. Check {name}; not retried")
+    log(f"[{item['id']}] " + " | ".join(lines))
+    try:
+        send("\n".join(lines), reply_to_message_id=item.get("message_id"))
+    except (OSError, RuntimeError, ValueError) as e:
+        log(f"could not report the result: {e}")
+
+
+def handle_update(update, owner):
+    if update.get("callback_query"):
+        handle_callback(update["callback_query"], owner)
+    elif update.get("message"):
+        handle_message(update["message"], owner)
+
+
+# ---------------------------------------------------------------- publish
+
+def run_cli(cmd):
+    """Returns ("ok" | "failed" | "unknown", detail).
+
+    "unknown" is a timeout: the service may have accepted the post before the CLI hung."""
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "unknown", "no answer in 120 s"
+    except (OSError, subprocess.SubprocessError) as e:
+        return "failed", str(e)[:300]
+    if res.returncode != 0:
+        return "failed", (res.stderr or res.stdout).strip()[:300] or f"exit {res.returncode}"
+    return "ok", res.stdout.strip()[:300]
+
+
+def post_x(text):
+    return run_cli(shlex.split(os.environ.get("VD_BIRD", "bird")) + ["tweet", "--", text])
+
+
+def post_linkedin(text):
+    """Through the Buffer CLI, like the standup: shareNow, because the press is the approval."""
+    key, channel = os.environ.get("BUFFER_API_KEY"), os.environ.get("BUFFER_LINKEDIN_CHANNEL")
+    if not key or not channel:
+        return "failed", "Buffer is not configured (BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL)"
+    return run_cli(shlex.split(os.environ.get("VD_BUFFER", "buffer")) + [
+        "posts", "create", "--channel-id", channel, f"--text={text}",
+        "--mode", "shareNow", "--scheduling-type", "automatic"])
+
+
+def cmd_listen(once=False):
+    owner = require("TELEGRAM_CHAT_ID")
+    offset_file = state_dir() / "telegram-offset"
+    offset = int(offset_file.read_text()) if offset_file.exists() else 0
+    log("listening")
+    while True:
+        try:
+            # Long poll: Telegram holds the request up to 30 s; the HTTP timeout is longer.
+            updates = telegram("getUpdates", http_timeout=45, offset=offset,
+                               timeout=0 if once else 30,
+                               allowed_updates=["message", "callback_query"])
+        except (OSError, RuntimeError, ValueError) as e:
+            log(f"getUpdates failed: {e}")
+            if once:
+                return 1
+            time.sleep(10)
+            continue
+        for update in updates:
+            try:
+                handle_update(update, owner)
+            except (OSError, ValueError) as e:
+                # The queue could not be saved. Do not ack: Telegram resends the update.
+                log(f"update {update.get('update_id')} not saved, will retry: {e}")
+                if once:
+                    return 1
+                time.sleep(10)
+                break
+            offset = update["update_id"] + 1
+            offset_file.write_text(str(offset))
+        if once:
+            return 0
+
+
+# ---------------------------------------------------------------- process
+
+def summarize(folder):
+    info_path = folder / "video.info.json"
+    info = json.loads(info_path.read_text()) if info_path.exists() else {}
+    transcript_path = folder / "transcript.txt"
+    transcript = transcript_path.read_text().strip() if transcript_path.exists() else ""
+    prompt = PROMPT.format(
+        title=info.get("title", ""), uploader=info.get("uploader", ""),
+        duration=info.get("duration", ""), description=(info.get("description") or "")[:1500],
+        transcript=transcript[:60000])
+    cmd = shlex.split(os.environ.get("VD_SUMMARIZER", "claude -p --model sonnet"))
+    res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                         timeout=SUMMARY_TIMEOUT)
+    if res.returncode != 0 or not res.stdout.strip():
+        raise RuntimeError(f"summarizer exit {res.returncode}: {res.stderr.strip()[-300:]}")
+    return info, res.stdout.strip()
+
+
+SECTION_RE = re.compile(r"^(SUMMARY|X POST|LINKEDIN POST):[ \t]*$", re.M)
+
+
+def parse_sections(text):
+    """Split the summarizer output into summary and the two post drafts.
+
+    Output without the markers is kept whole as the summary, so a model that ignores
+    the format still produces a message. "none" means no draft."""
+    parts = SECTION_RE.split(text)
+    if len(parts) < 3:
+        return {"summary": text.strip(), "x_post": "", "linkedin_post": ""}
+    found = {parts[i]: parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
+    draft = lambda key: "" if found.get(key, "").lower().strip(".") in ("", "none") else found[key]
+    return {"summary": found.get("SUMMARY") or text.strip(),
+            "x_post": draft("X POST"), "linkedin_post": draft("LINKEDIN POST")}
+
+
+def process_one(item):
+    grab = shlex.split(os.environ.get("VD_GRAB", "grab --no-video --cookies-from-browser chrome"))
+    out = state_dir() / "videos"
+    # A hung download must not block the queue: TimeoutExpired counts as a failed attempt.
+    res = subprocess.run(grab + ["-o", str(out), item["url"]], capture_output=True, text=True,
+                         timeout=int(os.environ.get("VD_GRAB_TIMEOUT", GRAB_TIMEOUT)))
+    lines = [l for l in res.stdout.splitlines() if l.strip()]
+    if res.returncode != 0 or not lines:
+        raise RuntimeError("grab failed: " + (res.stderr.strip().splitlines() or ["no output"])[-1])
+    folder = Path(lines[-1])
+    info, summary = summarize(folder)
+    sections = parse_sections(summary)
+    # Store the drafts as the message shows them: a button publishes exactly what was seen.
+    for key, budget in DRAFT_BUDGETS.items():
+        sections[key] = clip(sections[key], budget)
+    return {"folder": str(folder), "title": info.get("title") or item["url"],
+            "uploader": info.get("uploader") or "", "duration": info.get("duration"),
+            **sections}
+
+
+def cmd_process():
+    tried = set()
+    while True:
+        # Read the queue again after each video: a link queued meanwhile joins this run,
+        # because starting the unit while it runs does not start a second run.
+        with items() as data:
+            url = next((i["url"] for i in data
+                        if i["status"] == "queued" and i["url"] not in tried), None)
+        if url is None:
+            break
+        tried.add(url)
+        log(f"processing {url}")
+        # Work outside the lock: grab and the summary take minutes, and listen must keep queuing.
+        try:
+            result, error = process_one({"url": url}), None
+        except Exception as e:  # one bad video is a failed attempt, never the end of the queue
+            result, error = None, f"{type(e).__name__}: {e}"
+        with items() as data:
+            item = next((i for i in data if i["url"] == url), None)
+            if item is None:
+                continue
+            item["attempts"] += 1
+            if result:
+                item.update(result, status="done", processed_at=now())
+                item.pop("error", None)
+            else:
+                item["error"] = error
+                if item["attempts"] >= MAX_ATTEMPTS:
+                    item.update(status="failed", processed_at=now())
+                log(f"failed ({item['attempts']}/{MAX_ATTEMPTS}): {url}: {error}")
+        notify_pending()
+    notify_pending()
+    return 0
+
+
+def keyboard(item):
+    row = []
+    if item.get("x_post"):
+        row.append({"text": "Post on 𝕏", "callback_data": f"vd:{item['id']}:x"})
+    if item.get("linkedin_post"):
+        row.append({"text": "Post on LinkedIn", "callback_data": f"vd:{item['id']}:li"})
+    if len(row) == 2:
+        row.append({"text": "Both", "callback_data": f"vd:{item['id']}:both"})
+    return {"inline_keyboard": [row]} if row else None
+
+
+def notify_pending():
+    """Send one message per processed video that has not been sent yet.
+
+    A failed send leaves the item unsent, and the next process run tries again."""
+    with items() as data:
+        ready = [dict(i) for i in data
+                 if i["status"] in ("done", "failed") and not i.get("message_id")]
+    for item in ready:
+        if "id" not in item:
+            item["id"] = item_id(item["url"])
+        extra = {}
+        markup = keyboard(item) if item["status"] == "done" else None
+        if markup:
+            extra["reply_markup"] = markup
+        try:
+            msg = send(format_item(item), parse_mode="HTML", **extra)
+        except (OSError, RuntimeError, ValueError) as e:
+            log(f"could not send {item['url']}: {e}")
+            continue
+        with items() as data:
+            for i in data:
+                if i["url"] == item["url"]:
+                    i.update(id=item["id"], message_id=msg.get("message_id"), notified_at=now())
+
+
+# ---------------------------------------------------------------- message
+
+def tg_len(text):
+    """Length as Telegram counts it: UTF-16 code units (an emoji counts 2)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+DRAFT_BUDGETS = {"x_post": 450, "linkedin_post": 1500}
+
+
+def clip(text, budget):
+    """Cut plain text to the budget, in UTF-16 units: Telegram counts the text after it
+    parses the HTML, so the budget applies to the plain text, not to the escaped form."""
+    while tg_len(text) > budget and text:
+        text = text[: max(0, int(len(text) * 0.9) - 1)].rstrip() + "…"
+    return text
+
+
+def escape_clipped(text, budget):
+    """Cut the PLAIN text, then HTML-escape it. Cutting after escaping could split an
+    entity like &amp; and make Telegram reject the message on every retry."""
+    return html.escape(clip(text, budget), quote=False)
+
+
+def format_item(item):
+    title = escape_clipped(item.get("title") or item["url"], 200)
+    who = f" · {escape_clipped(item['uploader'], 80)}" if item.get("uploader") else ""
+    url = item["url"]
+    # A huge URL would not fit next to the summary; keep the title without the link then.
+    head = (f'<b><a href="{html.escape(url, quote=True)}">{title}</a></b>{who}'
+            if len(url) <= 300 else f"<b>{title}</b>{who}")
+    if item["status"] == "failed":
+        return f"🎬 {head}\n⚠️ Could not process: {escape_clipped(item.get('error') or '?', 500)}"
+    block = f"🎬 {head}\n{escape_clipped(item['summary'], 1000)}"
+    if item.get("x_post"):
+        block += f"\n\n<b>𝕏 draft</b>\n<blockquote>{escape_clipped(item['x_post'], DRAFT_BUDGETS['x_post'])}</blockquote>"
+    if item.get("linkedin_post"):
+        # Collapsed on the phone: tap to expand.
+        block += ("\n<b>LinkedIn draft</b>\n<blockquote expandable>"
+                  f"{escape_clipped(item['linkedin_post'], DRAFT_BUDGETS['linkedin_post'])}</blockquote>")
+    return block
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ("listen", "process"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    if argv[1] == "listen":
+        return cmd_listen(once="--once" in argv)
+    return cmd_process()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

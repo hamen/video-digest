@@ -1,0 +1,21 @@
+[Unit]
+Description=video-digest: queue video links sent to the Telegram bot, publish drafts on button press
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# bird (X) and the Buffer CLI (LinkedIn, a script run by /usr/bin/node) are in ~/.npm-global/bin.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# The bot token comes straight from the Nuc Social bot's own file; it is never copied.
+# Telegram allows ONE reader per bot: claude-telegram-bot-social.service must stay off.
+EnvironmentFile=%h/claude-telegram-bot-social/.env
+# LinkedIn through Buffer: the same keys as the standup button. Optional.
+EnvironmentFile=-%h/.config/standup/buffer.env
+# Last, so it wins: TELEGRAM_CHAT_ID and any VD_* overrides.
+EnvironmentFile=%h/.config/video-digest/env
+ExecStart=%h/code/video-digest/video-digest listen
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

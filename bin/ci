@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Every check this repo has. .githooks/pre-push runs it before each push.
+# Enable the hook once per clone: git config core.hooksPath .githooks
+#   syntax   py_compile on the tool and the tests; bash -n on the shell files
+#   units    systemd-analyze verify on the unit files (skipped where systemd is missing)
+#   tests    python3 -m unittest discover -s tests (fake Telegram, grab and summarizer)
+# CI_MODE is accepted, not used: the whole run takes about 10 seconds.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+echo "== syntax"
+python3 -m py_compile video-digest tests/*.py tests/fakes/*.py
+bash -n bin/ci bin/install .githooks/pre-push
+echo "== units"
+if command -v systemd-analyze >/dev/null; then
+  # The units point at ~/code/video-digest and ~/.config/video-digest/env, which a fresh
+  # machine lacks; report only real unit-file errors.
+  out=$(systemd-analyze --user verify systemd/* 2>&1 | grep -vE 'is not executable|video-digest/env|claude-code-token.env|claude-telegram-bot-social/.env|standup/buffer.env' || true)
+  [ -z "$out" ] || { echo "$out" >&2; exit 1; }
+fi
+echo "== tests"
+python3 -m unittest discover -s tests
+echo "bin/ci: all green"
