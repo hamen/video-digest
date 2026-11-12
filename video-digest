@@ -60,7 +60,7 @@ SUMMARY:
 Action: <one concrete thing Ivan could try this week, or "none" if nothing applies>
 
 X POST:
-<a post for Ivan's X account, at most 270 characters, no link, in his voice (guide at the end)>
+<a post for Ivan's X account, at most 270 characters, no link, in his voice (see the X voice guide below)>
 
 LINKEDIN POST:
 <a post for Ivan's LinkedIn, 60 to 150 words, in 2 or 3 short paragraphs>
@@ -79,7 +79,7 @@ connects to the point; never restate them as a bio line. Never invent an event, 
 client, a story, a plan, a feeling, an opinion or an observation about him: no "I can see how \
 that plays out", no "I see this from both sides", no lesson he never stated. When in doubt, \
 report what the creator said and stop.
-- The X post follows the X voice guide at the end of this prompt for rhythm, tone and emoji: \
+- The X post follows the X voice guide below for rhythm, tone and emoji: \
 flowing first-person sentences, not clipped one-liners, and at most one emoji, only at the very \
 end. Where the guide shows personal stories, remember that you know none: the rules here on \
 facts about Ivan always win over the guide. Never write that Ivan liked, laughed at, agrees \
@@ -92,7 +92,7 @@ or exclamation marks.
 liked", a question that you answer yourself, a closing question like "Thoughts?" or "Agree?", \
 one sentence per line, thread markers.
 - Write "none" for both posts if the video has nothing worth sharing.
-- Before you answer, check both posts against the AI slop patterns at the end of this prompt and \
+- Before you answer, check both posts against the AI slop patterns below and \
 rewrite every sentence that matches one. Never invent a fact to replace a pattern: cut the \
 sentence instead. A closing line of wisdom (C-05, R-09) is the most common hit: end on a fact.
 
@@ -408,7 +408,7 @@ def voice_guide():
         text = path.read_text()
     except (OSError, ValueError) as e:
         raise RuntimeError(f"ivan-x-voice skill not readable: {e}") from e
-    text = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S).strip()
+    text = re.sub(r"\A\ufeff?---\r?\n.*?\r?\n---\r?\n", "", text, flags=re.S).strip()
     if not text:
         raise RuntimeError(f"ivan-x-voice skill is empty: {path}")
     return text

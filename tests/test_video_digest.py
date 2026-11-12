@@ -452,6 +452,17 @@ class VideoDigestTest(unittest.TestCase):
         self.assertIn("ivan-x-voice", item["error"])
         self.assertNotIn("x_post", item)
 
+    def test_empty_or_front_matter_only_voice_file_fails_the_video(self):
+        for i, body in enumerate(["", "---\nname: x\n---\n", "\ufeff---\r\nname: x\r\n---\r\n"]):
+            voice = self.tmp / f"voice{i}.md"
+            voice.write_text(body)
+            self.queue(f"https://youtu.be/v{i}")
+            self.run_tool("process", VD_VOICE_FILE=str(voice))
+        for item in self.items():
+            self.assertIn("ivan-x-voice", item["error"])
+            self.assertNotIn("x_post", item)
+        self.assertFalse([l for l in self.log.read_text().splitlines() if l.startswith("prompt ")])
+
     def test_draft_starting_with_a_dash_is_not_a_flag(self):
         item = self.ready_item()
         self.press(f"vd:{item['id']}:x")
