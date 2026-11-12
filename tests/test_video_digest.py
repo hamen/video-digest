@@ -369,6 +369,32 @@ class VideoDigestTest(unittest.TestCase):
         self.assertTrue(published.startswith("Post about &&&"))
         self.assertIn(f"<blockquote>{html.escape(published, quote=False)}</blockquote>", shown)
 
+    def test_post_timeout_keeps_the_attempt_and_never_reposts(self):
+        item = self.ready_item()
+        mod = load_module()
+        cb = {"id": "cb1", "from": {"id": int(OWNER)}, "data": f"vd:{item['id']}:x"}
+        hang = subprocess.TimeoutExpired("bird", 120)
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(mod.subprocess, "run", side_effect=hang) as run:
+                mod.handle_callback(cb, OWNER)
+                mod.handle_callback(cb, OWNER)
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(self.items()[0].get("posting_x"))
+        self.assertIn("did not finish", self.tg.sent()[-1]["text"])
+
+    def test_unexpected_error_on_one_video_does_not_stop_the_queue(self):
+        self.queue("https://youtu.be/one", "https://youtu.be/two")
+        mod = load_module()
+        real = mod.process_one
+        bad = lambda item: (_ for _ in ()).throw(TypeError("bad metadata")) \
+            if item["url"].endswith("one") else real(item)
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(mod, "process_one", bad):
+            self.assertEqual(mod.cmd_process(), 0)
+        one, two = self.items()
+        self.assertEqual((one["status"], one["attempts"]), ("queued", 1))
+        self.assertIn("TypeError", one["error"])
+        self.assertEqual(two["status"], "done")
+
     def test_draft_starting_with_a_dash_is_not_a_flag(self):
         item = self.ready_item()
         self.press(f"vd:{item['id']}:x")
@@ -389,7 +415,8 @@ class VideoDigestTest(unittest.TestCase):
         argv = json.loads(line[len("post buffer "):])
         self.assertEqual(argv[argv.index("--mode") + 1], "shareNow")
         self.assertEqual(argv[argv.index("--channel-id") + 1], "chan")
-        self.assertTrue(argv[argv.index("--text") + 1].startswith("Longer post about One."))
+        self.assertTrue(next(a for a in argv if a.startswith("--text=")).startswith(
+            "--text=Longer post about One."))
 
     def test_both_after_x_posts_only_linkedin(self):
         item = self.ready_item()

@@ -273,10 +273,17 @@ def handle_callback(cb, owner):
         if reason:
             lines.append(reason)
             continue
-        ok, detail = post_x(text) if dest == "x" else post_linkedin(text)
-        # A failed save here propagates: the attempt mark stays and blocks any repost.
-        update_item(item["id"], **({flag: now(), attempt: None} if ok else {attempt: None}))
-        lines.append(f"{'✓' if ok else '✗'} {name}: {'posted' if ok else detail}")
+        status, detail = post_x(text) if dest == "x" else post_linkedin(text)
+        # Only a clear refusal clears the attempt mark. A timeout keeps it, and a failed
+        # save here propagates with the mark still set: either way, no repost.
+        if status == "ok":
+            update_item(item["id"], **{flag: now(), attempt: None})
+            lines.append(f"✓ {name}: posted")
+        elif status == "failed":
+            update_item(item["id"], **{attempt: None})
+            lines.append(f"✗ {name}: {detail}")
+        else:
+            lines.append(f"? {name}: {detail}. Check {name}; not retried")
     log(f"[{item['id']}] " + " | ".join(lines))
     try:
         send("\n".join(lines), reply_to_message_id=item.get("message_id"))
@@ -293,14 +300,19 @@ def handle_update(update, owner):
 
 # ---------------------------------------------------------------- publish
 
-def run_cli(cmd, env=None):
+def run_cli(cmd):
+    """Returns ("ok" | "failed" | "unknown", detail).
+
+    "unknown" is a timeout: the service may have accepted the post before the CLI hung."""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "unknown", "no answer in 120 s"
     except (OSError, subprocess.SubprocessError) as e:
-        return False, str(e)[:300]
+        return "failed", str(e)[:300]
     if res.returncode != 0:
-        return False, (res.stderr or res.stdout).strip()[:300] or f"exit {res.returncode}"
-    return True, res.stdout.strip()[:300]
+        return "failed", (res.stderr or res.stdout).strip()[:300] or f"exit {res.returncode}"
+    return "ok", res.stdout.strip()[:300]
 
 
 def post_x(text):
@@ -311,9 +323,9 @@ def post_linkedin(text):
     """Through the Buffer CLI, like the standup: shareNow, because the press is the approval."""
     key, channel = os.environ.get("BUFFER_API_KEY"), os.environ.get("BUFFER_LINKEDIN_CHANNEL")
     if not key or not channel:
-        return False, "Buffer is not configured (BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL)"
+        return "failed", "Buffer is not configured (BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL)"
     return run_cli(shlex.split(os.environ.get("VD_BUFFER", "buffer")) + [
-        "posts", "create", "--channel-id", channel, "--text", text,
+        "posts", "create", "--channel-id", channel, f"--text={text}",
         "--mode", "shareNow", "--scheduling-type", "automatic"])
 
 
@@ -490,7 +502,7 @@ DRAFT_BUDGETS = {"x_post": 450, "linkedin_post": 1500}
 def clip(text, budget):
     """Cut plain text to the budget, in UTF-16 units: Telegram counts the text after it
     parses the HTML, so the budget applies to the plain text, not to the escaped form."""
-    while tg_len(text) > budget:
+    while tg_len(text) > budget and text:
         text = text[: max(0, int(len(text) * 0.9) - 1)].rstrip() + "…"
     return text
 
