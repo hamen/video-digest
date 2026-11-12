@@ -50,7 +50,8 @@ class FakeTelegram:
                 elif method == "getUpdates":
                     result = {"ok": True, "result": [u for u in fake.updates
                                                      if u["update_id"] >= body.get("offset", 0)]}
-                elif method == "sendMessage" and fake.fail_send:
+                elif method == "sendMessage" and fake.fail_send_from is not None \
+                        and len([c for c in fake.calls if c[0] == "sendMessage"]) > fake.fail_send_from:
                     result = {"ok": False, "description": "Bad Request: can't parse entities"}
                 else:
                     result = {"ok": True, "result": {"message_id": 1}}
@@ -60,7 +61,7 @@ class FakeTelegram:
                 self.end_headers()
                 self.wfile.write(data)
 
-        self.fail_send = False
+        self.fail_send_from = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_port}"
@@ -221,28 +222,97 @@ class VideoDigestTest(unittest.TestCase):
     def test_failed_send_leaves_items_for_the_next_digest(self):
         self.queue("https://youtu.be/one")
         self.run_tool("process")
-        self.tg.fail_send = True
+        self.tg.fail_send_from = 0
         r = self.run_tool("digest")
         self.assertNotEqual(r.returncode, 0)
         self.assertIsNone(self.items()[0].get("digested_at"))
+
+    def test_second_message_failure_does_not_resend_the_first(self):
+        long = "https://youtu.be/{n}?title=" + "T" * 290
+        self.queue(*[long.format(n=n) for n in range(12)])
+        items = self.items()
+        for i in items:  # done items with a long summary each, so the digest needs 2+ messages
+            i.update(status="done", title="T" * 290, uploader="u", summary="s" * 2900)
+        (self.tmp / "state" / "items.json").write_text(json.dumps(items))
+        self.tg.fail_send_from = 1
+        r = self.run_tool("digest")
+        self.assertNotEqual(r.returncode, 0)
+        stamped = [i for i in self.items() if i.get("digested_at")]
+        self.assertGreater(len(stamped), 0)
+        self.assertLess(len(stamped), 12)
+        self.tg.fail_send_from = None
+        self.tg.calls.clear()
+        self.run_tool("digest")
+        resent = "".join(b["text"] for b in self.tg.sent())
+        first_url = stamped[0]["url"]
+        self.assertNotIn(first_url.replace("&", "&amp;"), resent)
+        self.assertTrue(all(i.get("digested_at") for i in self.items()))
+
+    def test_storage_failure_does_not_ack_the_update(self):
+        state = self.tmp / "state"
+        state.mkdir(parents=True)
+        (state / "items.json").write_text("this is not json")
+        self.tg.updates = [message(1, "https://youtu.be/one")]
+        r = self.run_tool("listen", "--once")
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse((state / "telegram-offset").exists())
+        (state / "items.json").write_text("[]")
+        r = self.run_tool("listen", "--once")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([i["url"] for i in self.items()], ["https://youtu.be/one"])
+
+    def test_lost_reply_still_queues_and_acks(self):
+        self.tg.fail_send_from = 0
+        self.tg.updates = [message(1, "https://youtu.be/one")]
+        r = self.run_tool("listen", "--once")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.items()), 1)
+        self.assertEqual((self.tmp / "state" / "telegram-offset").read_text(), "2")
+
+    def test_braces_in_metadata_do_not_break_the_prompt(self):
+        self.queue("https://youtu.be/one?title=%7Bx%7D+and+%7B0%7D")
+        r = self.run_tool("process")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.items()[0]["summary"], "SUMMARY {x} and {0}")
+
+    def test_empty_transcript_still_gets_summarized(self):
+        self.queue("https://youtu.be/one?mode=silent")
+        self.run_tool("process")
+        self.assertEqual(self.items()[0]["status"], "done")
+        prompt = next(l for l in self.log.read_text().splitlines() if l.startswith("prompt "))
+        self.assertIn("If the transcript is empty", prompt)
+
+    def test_hung_grab_counts_as_a_failed_attempt(self):
+        self.queue("https://youtu.be/slow?mode=hang", "https://youtu.be/two")
+        r = self.run_tool("process", VD_GRAB_TIMEOUT="2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        slow, two = self.items()
+        self.assertEqual((slow["status"], slow["attempts"]), ("queued", 1))
+        self.assertIn("timed out", slow["error"])
+        self.assertEqual(two["status"], "done")
 
     # ---- message packing
 
     def test_split_messages_stays_under_the_limit(self):
         mod = load_module()
         blocks = [f"block {n} " + "x" * 900 for n in range(10)]
-        msgs = mod.split_messages("HEAD", blocks, limit=4096)
-        self.assertGreater(len(msgs), 1)
-        self.assertTrue(all(len(m) <= 4096 for m in msgs))
-        self.assertTrue(all(m.startswith("HEAD") for m in msgs))
-        joined = "".join(msgs)
-        self.assertTrue(all(f"block {n} " in joined for n in range(10)))
+        packs = mod.split_messages("HEAD 🎬", blocks, limit=4096)
+        self.assertGreater(len(packs), 1)
+        self.assertTrue(all(mod.tg_len(text) <= 4096 for text, _ in packs))
+        self.assertEqual(sorted(k for _, idx in packs for k in idx), list(range(10)))
 
-    def test_split_messages_cuts_one_oversized_block(self):
+    def test_long_html_title_is_clipped_before_escaping(self):
         mod = load_module()
-        msgs = mod.split_messages("HEAD", ["y" * 10000], limit=4096)
-        self.assertEqual(len(msgs), 1)
-        self.assertLessEqual(len(msgs[0]), 4096)
+        item = {"url": "https://x.example/v", "status": "done", "uploader": "u",
+                "title": "&" * 2000, "summary": "<b>" * 2000}
+        block = mod.format_item(item)
+        self.assertLess(mod.tg_len(block), 4096)
+        # every & is part of a whole entity: no "&am" or "&l" fragment at a cut
+        self.assertNotRegex(block.replace("&amp;", "").replace("&lt;", "").replace("&gt;", ""), "&")
+
+    def test_tg_len_counts_emoji_as_two(self):
+        mod = load_module()
+        self.assertEqual(mod.tg_len("a🎬"), 3)
 
 
 if __name__ == "__main__":

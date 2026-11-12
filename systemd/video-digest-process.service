@@ -1,6 +1,7 @@
 [Unit]
 Description=video-digest: download, transcribe and summarize queued links
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot

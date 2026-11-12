@@ -2,7 +2,7 @@
 Description=video-digest: daily digest at 9:00
 
 [Timer]
-OnCalendar=*-*-* 09:00:00
+OnCalendar=*-*-* 09:00:00 Europe/Rome
 Persistent=true
 
 [Install]

@@ -3,7 +3,7 @@
 
 Writes OUT/<id>/video.info.json and transcript.txt and prints the folder, like grab.
 The URL query sets the case: mode=fail (exit 1, no stdout), mode=silent (empty
-transcript), title=TEXT (video title). Appends each URL to $FAKE_LOG.
+transcript), mode=hang (sleep 60 s), title=TEXT (video title). Appends each URL to $FAKE_LOG.
 """
 import hashlib
 import json
@@ -16,6 +16,9 @@ out, url = sys.argv[sys.argv.index("-o") + 1], sys.argv[-1]
 with open(os.environ["FAKE_LOG"], "a") as f:
     f.write(f"grab {url}\n")
 q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+if q.get("mode") == "hang":
+    import time
+    time.sleep(60)
 if q.get("mode") == "fail":
     print("grab: download failed: " + url, file=sys.stderr)
     sys.exit(1)

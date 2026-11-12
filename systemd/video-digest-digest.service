@@ -1,6 +1,7 @@
 [Unit]
 Description=video-digest: send the daily digest to Telegram
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot

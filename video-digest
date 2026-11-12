@@ -30,8 +30,9 @@ from pathlib import Path
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 MAX_ATTEMPTS = 2
-TELEGRAM_LIMIT = 4096  # characters per message
+TELEGRAM_LIMIT = 4096  # per message, counted in UTF-16 code units after entity parsing
 SUMMARY_TIMEOUT = 300
+GRAB_TIMEOUT = 1800
 
 PROMPT = """You summarize a short video for an indie developer who runs a portfolio of mobile \
 apps and grows them with content marketing. Below are the video metadata and its transcript \
@@ -120,16 +121,26 @@ def send(text, **extra):
 
 # ---------------------------------------------------------------- listen
 
+def reply(msg, text):
+    """Best effort: a lost "Queued" reply must not cost the link, which is already saved."""
+    try:
+        send(text, reply_to_message_id=msg.get("message_id"))
+    except (OSError, RuntimeError, ValueError) as e:
+        log(f"reply failed: {e}")
+
+
 def handle_update(update, owner):
-    """Queue the links in one update. Returns the number of new links."""
-    msg = update.get("message") or update.get("channel_post") or {}
+    """Queue the links in one update. Returns the number of new links.
+
+    A storage error propagates, so listen does not ack the update and Telegram resends it."""
+    msg = update.get("message") or {}
     if str(msg.get("chat", {}).get("id")) != owner:
         return 0  # only the owner's chat; strangers who find the bot get nothing
     text = " ".join(filter(None, [msg.get("text"), msg.get("caption")]))
     urls = [u.rstrip(").,") for u in URL_RE.findall(text)]
     if not urls:
-        send("Send me a video link (TikTok, Instagram, YouTube…). It goes in tomorrow's digest.",
-             reply_to_message_id=msg.get("message_id"))
+        reply(msg, "Send me a video link (TikTok, Instagram, YouTube…). "
+                   "It goes in tomorrow's digest.")
         return 0
     with items() as data:
         known = {i["url"] for i in data}
@@ -137,10 +148,9 @@ def handle_update(update, owner):
         for u in new:
             data.append({"url": u, "received_at": now(), "status": "queued", "attempts": 0})
     if new:
-        reply = f"Queued {len(new)} link{'s' if len(new) > 1 else ''}."
+        reply(msg, f"Queued {len(new)} link{'s' if len(new) > 1 else ''}.")
     else:
-        reply = "Already queued."
-    send(reply, reply_to_message_id=msg.get("message_id"))
+        reply(msg, "Already queued.")
     return len(new)
 
 
@@ -163,9 +173,13 @@ def cmd_listen(once=False):
         for update in updates:
             try:
                 handle_update(update, owner)
-            except (OSError, RuntimeError) as e:
-                log(f"update {update.get('update_id')} failed: {e}")
-            # Ack only after handling, so a crash replays the update instead of losing it.
+            except (OSError, ValueError) as e:
+                # The queue could not be saved. Do not ack: Telegram resends the update.
+                log(f"update {update.get('update_id')} not saved, will retry: {e}")
+                if once:
+                    return 1
+                time.sleep(10)
+                break
             offset = update["update_id"] + 1
             offset_file.write_text(str(offset))
         if once:
@@ -194,7 +208,9 @@ def summarize(folder):
 def process_one(item):
     grab = shlex.split(os.environ.get("VD_GRAB", "grab --no-video --cookies-from-browser chrome"))
     out = state_dir() / "videos"
-    res = subprocess.run(grab + ["-o", str(out), item["url"]], capture_output=True, text=True)
+    # A hung download must not block the queue: TimeoutExpired counts as a failed attempt.
+    res = subprocess.run(grab + ["-o", str(out), item["url"]], capture_output=True, text=True,
+                         timeout=int(os.environ.get("VD_GRAB_TIMEOUT", GRAB_TIMEOUT)))
     lines = [l for l in res.stdout.splitlines() if l.strip()]
     if res.returncode != 0 or not lines:
         raise RuntimeError("grab failed: " + (res.stderr.strip().splitlines() or ["no output"])[-1])
@@ -231,43 +247,70 @@ def cmd_process():
 
 # ---------------------------------------------------------------- digest
 
+def tg_len(text):
+    """Length as Telegram counts it: UTF-16 code units (an emoji counts 2)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def escape_clipped(text, budget):
+    """HTML-escape text, cutting the PLAIN text until the escaped form fits the budget.
+
+    Cutting after escaping could split an entity like &amp; and make Telegram reject
+    the message on every retry. The budget is generous because Telegram counts the text
+    after parsing entities, so the escaped length is an upper bound."""
+    out = html.escape(text, quote=False)
+    while tg_len(out) > budget:
+        text = text[: max(0, int(len(text) * 0.9) - 1)].rstrip() + "…"
+        out = html.escape(text, quote=False)
+    return out
+
+
 def format_item(item):
-    title = html.escape(item.get("title") or item["url"])
-    who = f" · {html.escape(item['uploader'])}" if item.get("uploader") else ""
-    head = f'<b><a href="{html.escape(item["url"], quote=True)}">{title}</a></b>{who}'
+    title = escape_clipped(item.get("title") or item["url"], 300)
+    who = f" · {escape_clipped(item['uploader'], 80)}" if item.get("uploader") else ""
+    url = item["url"]
+    # A huge URL would not fit next to the summary; keep the title without the link then.
+    head = (f'<b><a href="{html.escape(url, quote=True)}">{title}</a></b>{who}'
+            if len(url) <= 500 else f"<b>{title}</b>{who}")
     if item["status"] == "failed":
-        return f"{head}\n⚠️ Could not process: {html.escape(item.get('error', 'unknown error'))}"
-    return f"{head}\n{html.escape(item['summary'])}"
+        return f"{head}\n⚠️ Could not process: {escape_clipped(item.get('error') or '?', 500)}"
+    return f"{head}\n{escape_clipped(item['summary'], 3000)}"
 
 
 def split_messages(header, blocks, limit=TELEGRAM_LIMIT):
-    """Pack blocks into messages under the limit; a block is never split across two."""
-    messages, current = [], header
-    for block in blocks:
-        if len(block) + 2 > limit - len(header):
-            block = block[: limit - len(header) - 5] + "…"
-        if len(current) + 2 + len(block) > limit:
-            messages.append(current)
-            current = header
-        current += "\n\n" + block
-    messages.append(current)
-    return messages
+    """Pack blocks into messages under the limit. Returns [(text, [block indexes])].
+
+    format_item caps every block well under the limit, so a block is never cut."""
+    packs, text, idx = [], header, []
+    for n, block in enumerate(blocks):
+        if idx and tg_len(text) + 2 + tg_len(block) > limit:
+            packs.append((text, idx))
+            text, idx = header, []
+        text += "\n\n" + block
+        idx.append(n)
+    packs.append((text, idx))
+    return packs
 
 
 def cmd_digest():
     with items() as data:
-        ready = [i for i in data if i["status"] in ("done", "failed") and not i.get("digested_at")]
-        if not ready:
-            log("nothing to send")
-            return 0
-        day = datetime.now().strftime("%a %d %b")
-        n = len(ready)
-        header = f"🎬 <b>Video digest · {day}</b> · {n} video{'s' if n > 1 else ''}"
-        for text in split_messages(header, [format_item(i) for i in ready]):
-            send(text, parse_mode="HTML")
-        stamp = now()
-        for i in ready:
-            i["digested_at"] = stamp
+        ready = [dict(i) for i in data
+                 if i["status"] in ("done", "failed") and not i.get("digested_at")]
+    if not ready:
+        log("nothing to send")
+        return 0
+    day = datetime.now().strftime("%a %d %b")
+    n = len(ready)
+    header = f"🎬 <b>Video digest · {day}</b> · {n} video{'s' if n > 1 else ''}"
+    # Send outside the lock (listen and process keep working), and stamp each message's
+    # items right after Telegram accepts it: a later failure must not resend earlier parts.
+    for text, idx in split_messages(header, [format_item(i) for i in ready]):
+        send(text, parse_mode="HTML")
+        sent_urls = {ready[k]["url"] for k in idx}
+        with items() as data:
+            for i in data:
+                if i["url"] in sent_urls:
+                    i["digested_at"] = now()
     log(f"sent {n} items")
     return 0
 
