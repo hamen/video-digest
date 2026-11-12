@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""video-digest: a daily Telegram digest of the videos I send to a bot.
+
+  video-digest listen    long-poll the bot; queue every link that the owner sends
+  video-digest process   download + transcribe (grab) and summarize (claude -p) queued links
+  video-digest digest    send one Telegram message with every summary not sent yet
+
+Config (environment, usually from ~/.config/video-digest/env):
+  TELEGRAM_BOT_TOKEN   token of the digest bot (from @BotFather)
+  TELEGRAM_CHAT_ID     the owner's chat: the only chat the bot listens to and writes to
+  VD_STATE_DIR         state and downloads (default ~/.local/state/video-digest)
+  VD_GRAB              grab command (default: grab --no-video --cookies-from-browser chrome)
+  VD_SUMMARIZER        summary command, prompt on stdin (default: claude -p --model sonnet)
+  TELEGRAM_API         Bot API base URL (default https://api.telegram.org; tests override it)
+"""
+import contextlib
+import fcntl
+import html
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+URL_RE = re.compile(r"https?://[^\s<>\"']+")
+MAX_ATTEMPTS = 2
+TELEGRAM_LIMIT = 4096  # characters per message
+SUMMARY_TIMEOUT = 300
+
+PROMPT = """You summarize a short video for an indie developer who runs a portfolio of mobile \
+apps and grows them with content marketing. Below are the video metadata and its transcript \
+(speech-to-text, so expect misheard words and no punctuation).
+
+Write plain text, at most 120 words, in English, in exactly this shape:
+<one line: what the video is about, and who says it>
+- <2 to 4 lines: the concrete claims, techniques or numbers from the video>
+Action: <one concrete thing the developer could try this week, or "none" if nothing applies>
+
+Use only what the transcript and metadata say. Do not invent numbers, names or claims. If the \
+transcript is empty, write "No speech in this video." on the first line and summarize the title \
+and description only.
+
+Title: {title}
+Uploader: {uploader}
+Duration: {duration} s
+Description: {description}
+
+Transcript:
+{transcript}
+"""
+
+
+def log(msg):
+    print(f"{datetime.now().isoformat(timespec='seconds')} {msg}", file=sys.stderr, flush=True)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def state_dir():
+    d = Path(os.environ.get("VD_STATE_DIR", Path.home() / ".local/state/video-digest"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def require(name):
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"video-digest: {name} is not set")
+    return value
+
+
+# ---------------------------------------------------------------- state
+
+@contextlib.contextmanager
+def items():
+    """The item list in items.json, locked for the whole block, saved on exit.
+
+    listen, process and digest run as separate units and all write this file."""
+    d = state_dir()
+    with open(d / "items.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = d / "items.json"
+        data = json.loads(path.read_text()) if path.exists() else []
+        yield data
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(path)
+
+
+# ---------------------------------------------------------------- telegram
+
+def telegram(method, http_timeout=40, **params):
+    token = require("TELEGRAM_BOT_TOKEN")
+    base = os.environ.get("TELEGRAM_API", "https://api.telegram.org").rstrip("/")
+    req = urllib.request.Request(
+        f"{base}/bot{token}/{method}", data=json.dumps(params).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read() or b"{}")
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram {method}: {body.get('description', 'no description')}")
+    return body["result"]
+
+
+def send(text, **extra):
+    return telegram("sendMessage", chat_id=require("TELEGRAM_CHAT_ID"), text=text,
+                    disable_web_page_preview=True, **extra)
+
+
+# ---------------------------------------------------------------- listen
+
+def handle_update(update, owner):
+    """Queue the links in one update. Returns the number of new links."""
+    msg = update.get("message") or update.get("channel_post") or {}
+    if str(msg.get("chat", {}).get("id")) != owner:
+        return 0  # only the owner's chat; strangers who find the bot get nothing
+    text = " ".join(filter(None, [msg.get("text"), msg.get("caption")]))
+    urls = [u.rstrip(").,") for u in URL_RE.findall(text)]
+    if not urls:
+        send("Send me a video link (TikTok, Instagram, YouTube…). It goes in tomorrow's digest.",
+             reply_to_message_id=msg.get("message_id"))
+        return 0
+    with items() as data:
+        known = {i["url"] for i in data}
+        new = [u for u in dict.fromkeys(urls) if u not in known]
+        for u in new:
+            data.append({"url": u, "received_at": now(), "status": "queued", "attempts": 0})
+    if new:
+        reply = f"Queued {len(new)} link{'s' if len(new) > 1 else ''}."
+    else:
+        reply = "Already queued."
+    send(reply, reply_to_message_id=msg.get("message_id"))
+    return len(new)
+
+
+def cmd_listen(once=False):
+    owner = require("TELEGRAM_CHAT_ID")
+    offset_file = state_dir() / "telegram-offset"
+    offset = int(offset_file.read_text()) if offset_file.exists() else 0
+    log("listening")
+    while True:
+        try:
+            # Long poll: Telegram holds the request up to 30 s; the HTTP timeout is longer.
+            updates = telegram("getUpdates", http_timeout=45, offset=offset,
+                               timeout=0 if once else 30, allowed_updates=["message"])
+        except (OSError, RuntimeError, ValueError) as e:
+            log(f"getUpdates failed: {e}")
+            if once:
+                return 1
+            time.sleep(10)
+            continue
+        for update in updates:
+            try:
+                handle_update(update, owner)
+            except (OSError, RuntimeError) as e:
+                log(f"update {update.get('update_id')} failed: {e}")
+            # Ack only after handling, so a crash replays the update instead of losing it.
+            offset = update["update_id"] + 1
+            offset_file.write_text(str(offset))
+        if once:
+            return 0
+
+
+# ---------------------------------------------------------------- process
+
+def summarize(folder):
+    info_path = folder / "video.info.json"
+    info = json.loads(info_path.read_text()) if info_path.exists() else {}
+    transcript_path = folder / "transcript.txt"
+    transcript = transcript_path.read_text().strip() if transcript_path.exists() else ""
+    prompt = PROMPT.format(
+        title=info.get("title", ""), uploader=info.get("uploader", ""),
+        duration=info.get("duration", ""), description=(info.get("description") or "")[:1500],
+        transcript=transcript[:60000])
+    cmd = shlex.split(os.environ.get("VD_SUMMARIZER", "claude -p --model sonnet"))
+    res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                         timeout=SUMMARY_TIMEOUT)
+    if res.returncode != 0 or not res.stdout.strip():
+        raise RuntimeError(f"summarizer exit {res.returncode}: {res.stderr.strip()[-300:]}")
+    return info, res.stdout.strip()
+
+
+def process_one(item):
+    grab = shlex.split(os.environ.get("VD_GRAB", "grab --no-video --cookies-from-browser chrome"))
+    out = state_dir() / "videos"
+    res = subprocess.run(grab + ["-o", str(out), item["url"]], capture_output=True, text=True)
+    lines = [l for l in res.stdout.splitlines() if l.strip()]
+    if res.returncode != 0 or not lines:
+        raise RuntimeError("grab failed: " + (res.stderr.strip().splitlines() or ["no output"])[-1])
+    folder = Path(lines[-1])
+    info, summary = summarize(folder)
+    return {"folder": str(folder), "title": info.get("title") or item["url"],
+            "uploader": info.get("uploader") or "", "duration": info.get("duration"),
+            "summary": summary}
+
+
+def cmd_process():
+    with items() as data:
+        pending = [i["url"] for i in data if i["status"] == "queued"]
+    for url in pending:
+        log(f"processing {url}")
+        # Work outside the lock: grab and the summary take minutes, and listen must keep queuing.
+        try:
+            result, error = process_one({"url": url}), None
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as e:
+            result, error = None, str(e)
+        with items() as data:
+            item = next(i for i in data if i["url"] == url)
+            item["attempts"] += 1
+            if result:
+                item.update(result, status="done", processed_at=now())
+                item.pop("error", None)
+            else:
+                item["error"] = error
+                if item["attempts"] >= MAX_ATTEMPTS:
+                    item.update(status="failed", processed_at=now())
+                log(f"failed ({item['attempts']}/{MAX_ATTEMPTS}): {url}: {error}")
+    return 0
+
+
+# ---------------------------------------------------------------- digest
+
+def format_item(item):
+    title = html.escape(item.get("title") or item["url"])
+    who = f" · {html.escape(item['uploader'])}" if item.get("uploader") else ""
+    head = f'<b><a href="{html.escape(item["url"], quote=True)}">{title}</a></b>{who}'
+    if item["status"] == "failed":
+        return f"{head}\n⚠️ Could not process: {html.escape(item.get('error', 'unknown error'))}"
+    return f"{head}\n{html.escape(item['summary'])}"
+
+
+def split_messages(header, blocks, limit=TELEGRAM_LIMIT):
+    """Pack blocks into messages under the limit; a block is never split across two."""
+    messages, current = [], header
+    for block in blocks:
+        if len(block) + 2 > limit - len(header):
+            block = block[: limit - len(header) - 5] + "…"
+        if len(current) + 2 + len(block) > limit:
+            messages.append(current)
+            current = header
+        current += "\n\n" + block
+    messages.append(current)
+    return messages
+
+
+def cmd_digest():
+    with items() as data:
+        ready = [i for i in data if i["status"] in ("done", "failed") and not i.get("digested_at")]
+        if not ready:
+            log("nothing to send")
+            return 0
+        day = datetime.now().strftime("%a %d %b")
+        n = len(ready)
+        header = f"🎬 <b>Video digest · {day}</b> · {n} video{'s' if n > 1 else ''}"
+        for text in split_messages(header, [format_item(i) for i in ready]):
+            send(text, parse_mode="HTML")
+        stamp = now()
+        for i in ready:
+            i["digested_at"] = stamp
+    log(f"sent {n} items")
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ("listen", "process", "digest"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    cmd = argv[1]
+    if cmd == "listen":
+        return cmd_listen(once="--once" in argv)
+    return cmd_process() if cmd == "process" else cmd_digest()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
