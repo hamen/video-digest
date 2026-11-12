@@ -106,7 +106,8 @@ class VideoDigestTest(unittest.TestCase):
                         VD_BUFFER=f"{sys.executable} {FAKES / 'fake_poster.py'} buffer",
                         BUFFER_API_KEY="bk", BUFFER_LINKEDIN_CHANNEL="chan",
                         VD_KICK=f"touch {self.tmp / 'kicked'}",
-                        VD_SLOP_FILE=str(FAKES / "slop.md"))
+                        VD_SLOP_FILE=str(FAKES / "slop.md"),
+                        VD_VOICE_FILE=str(FAKES / "voice.md"))
 
     def run_tool(self, *args, **env):
         return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True,
@@ -262,7 +263,7 @@ class VideoDigestTest(unittest.TestCase):
         self.assertIn("<blockquote expandable>Longer post about Funnels.", text)
         prompt = next(l for l in self.log.read_text().splitlines() if l.startswith("prompt "))
         self.assertIn("Never invent an event", prompt)
-        self.assertIn("No em dashes", prompt)
+        self.assertIn("Neither post has em dashes", prompt)
 
     # ---- real-time messages
 
@@ -436,6 +437,20 @@ class VideoDigestTest(unittest.TestCase):
         path = next(l for l in unit.splitlines() if l.startswith("Environment=PATH="))
         dirs = path.split("=", 2)[2].split(":")
         self.assertLess(dirs.index("/home/linuxbrew/.linuxbrew/bin"), dirs.index("/usr/bin"))
+
+    def test_every_prompt_carries_the_x_voice_without_front_matter(self):
+        self.queue("https://youtu.be/one")
+        self.run_tool("process")
+        (prompt,) = [l for l in self.log.read_text().splitlines() if l.startswith("prompt ")]
+        self.assertIn("FAKE-VOICE-RULE", prompt)
+        self.assertNotIn("name: fake-voice", prompt)
+
+    def test_missing_voice_file_fails_the_video(self):
+        self.queue("https://youtu.be/one")
+        self.run_tool("process", VD_VOICE_FILE=str(self.tmp / "missing.md"))
+        item = self.items()[0]
+        self.assertIn("ivan-x-voice", item["error"])
+        self.assertNotIn("x_post", item)
 
     def test_draft_starting_with_a_dash_is_not_a_flag(self):
         item = self.ready_item()
