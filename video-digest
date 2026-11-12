@@ -34,18 +34,43 @@ TELEGRAM_LIMIT = 4096  # per message, counted in UTF-16 code units after entity 
 SUMMARY_TIMEOUT = 300
 GRAB_TIMEOUT = 1800
 
-PROMPT = """You summarize a short video for an indie developer who runs a portfolio of mobile \
-apps and grows them with content marketing. Below are the video metadata and its transcript \
-(speech-to-text, so expect misheard words and no punctuation).
+PROMPT = """You work for Ivan, an Android and Flutter developer with 15 years of experience who \
+builds and ships a portfolio of indie mobile apps in public. Below are the metadata and the \
+transcript of a short video he liked (speech-to-text, so expect misheard words and no punctuation).
 
-Write plain text, at most 120 words, in English, in exactly this shape:
+Write three sections in English, with these exact marker lines. Output nothing before the first \
+marker and nothing after the LinkedIn post: no notes, no checks, no comments. Everything you \
+write goes straight into a Telegram message.
+
+SUMMARY:
 <one line: what the video is about, and who says it>
 - <2 to 4 lines: the concrete claims, techniques or numbers from the video>
-Action: <one concrete thing the developer could try this week, or "none" if nothing applies>
+Action: <one concrete thing Ivan could try this week, or "none" if nothing applies>
 
-Use only what the transcript and metadata say. Do not invent numbers, names or claims. If the \
-transcript is empty, write "No speech in this video." on the first line and summarize the title \
-and description only.
+X POST:
+<a post for Ivan's X account, at most 270 characters, no link>
+
+LINKEDIN POST:
+<a post for Ivan's LinkedIn, 60 to 150 words, in 2 or 3 short paragraphs>
+
+Rules for all sections:
+- Use only what the transcript and metadata say. Do not invent numbers, names, quotes or claims.
+- If the transcript is empty, start the summary with "No speech in this video.", summarize the \
+title and description only, and write "none" for both posts.
+
+Rules for the two posts:
+- Credit the creator. Use a real name only when the title, description or uploader name states \
+it; otherwise use the uploader handle with @. Never guess who speaks in a clip.
+- Ivan's own angle may use only these facts: he builds and ships indie mobile apps in public, \
+and he has 15 years of Android experience. Use at most one of them, in passing, and only where it \
+connects to the point; never restate them as a bio line. Never invent an event, a number, a \
+client, a story, a plan or a feeling about him.
+- Plain, direct sentences. No em dashes, no hashtags, no emoji, no exclamation marks.
+- Never use: "here's the thing", "the truth is", "let that sink in", "game changer", "unlock", \
+"leverage", "delve", "journey", "it's not X, it's Y", "I keep thinking about", "the part I \
+liked", a question that you answer yourself, a closing question like "Thoughts?" or "Agree?", \
+one sentence per line, thread markers.
+- Write "none" for both posts if the video has nothing worth sharing.
 
 Title: {title}
 Uploader: {uploader}
@@ -205,6 +230,23 @@ def summarize(folder):
     return info, res.stdout.strip()
 
 
+SECTION_RE = re.compile(r"^(SUMMARY|X POST|LINKEDIN POST):[ \t]*$", re.M)
+
+
+def parse_sections(text):
+    """Split the summarizer output into summary and the two post drafts.
+
+    Output without the markers is kept whole as the summary, so a model that ignores
+    the format still produces a digest entry. "none" means no draft."""
+    parts = SECTION_RE.split(text)
+    if len(parts) < 3:
+        return {"summary": text.strip(), "x_post": "", "linkedin_post": ""}
+    found = {parts[i]: parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
+    draft = lambda key: "" if found.get(key, "").lower().strip(".") in ("", "none") else found[key]
+    return {"summary": found.get("SUMMARY") or text.strip(),
+            "x_post": draft("X POST"), "linkedin_post": draft("LINKEDIN POST")}
+
+
 def process_one(item):
     grab = shlex.split(os.environ.get("VD_GRAB", "grab --no-video --cookies-from-browser chrome"))
     out = state_dir() / "videos"
@@ -218,7 +260,7 @@ def process_one(item):
     info, summary = summarize(folder)
     return {"folder": str(folder), "title": info.get("title") or item["url"],
             "uploader": info.get("uploader") or "", "duration": info.get("duration"),
-            "summary": summary}
+            **parse_sections(summary)}
 
 
 def cmd_process():
@@ -266,15 +308,22 @@ def escape_clipped(text, budget):
 
 
 def format_item(item):
-    title = escape_clipped(item.get("title") or item["url"], 300)
+    title = escape_clipped(item.get("title") or item["url"], 200)
     who = f" · {escape_clipped(item['uploader'], 80)}" if item.get("uploader") else ""
     url = item["url"]
     # A huge URL would not fit next to the summary; keep the title without the link then.
     head = (f'<b><a href="{html.escape(url, quote=True)}">{title}</a></b>{who}'
-            if len(url) <= 500 else f"<b>{title}</b>{who}")
+            if len(url) <= 300 else f"<b>{title}</b>{who}")
     if item["status"] == "failed":
         return f"{head}\n⚠️ Could not process: {escape_clipped(item.get('error') or '?', 500)}"
-    return f"{head}\n{escape_clipped(item['summary'], 3000)}"
+    block = f"{head}\n{escape_clipped(item['summary'], 1000)}"
+    if item.get("x_post"):
+        block += f"\n\n<b>𝕏 draft</b>\n<blockquote>{escape_clipped(item['x_post'], 450)}</blockquote>"
+    if item.get("linkedin_post"):
+        # Collapsed on the phone: tap to expand.
+        block += ("\n<b>LinkedIn draft</b>\n<blockquote expandable>"
+                  f"{escape_clipped(item['linkedin_post'], 1500)}</blockquote>")
+    return block
 
 
 def split_messages(header, blocks, limit=TELEGRAM_LIMIT):

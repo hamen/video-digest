@@ -7,10 +7,12 @@ A daily Telegram digest of the videos I send to a bot.
    (`TELEGRAM_CHAT_ID`) and ignores everyone else.
 2. **process** (timer, every 10 minutes): [`grab`](https://github.com/hamen/video-grabber)
    downloads and transcribes each queued link, and `claude -p --model sonnet` writes an
-   actionable summary: what the video says, the concrete claims, and one action. A link that
-   fails twice is marked failed.
+   actionable summary (what the video says, the concrete claims, one action) plus an X draft
+   and a LinkedIn draft that credit the creator. The drafts may use only two facts about me
+   and must invent nothing. A link that fails twice is marked failed.
 3. **digest** (timer, 9:00 Rome): one Telegram message with every summary and failure not sent
-   yet. Nothing is sent on a day with no videos.
+   yet; the LinkedIn draft is a collapsed quote. Nothing is sent on a day with no videos.
+   Publishing stays manual: the digest only proposes drafts.
 
 State is in `~/.local/state/video-digest/`: `items.json` (the queue and the summaries,
 locked with flock because the three units write it), `telegram-offset`, and `videos/`

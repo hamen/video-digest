@@ -291,6 +291,21 @@ class VideoDigestTest(unittest.TestCase):
         self.assertIn("timed out", slow["error"])
         self.assertEqual(two["status"], "done")
 
+    def test_drafts_reach_the_digest(self):
+        self.queue("https://youtu.be/one?title=Funnels")
+        self.run_tool("process", FAKE_SUM="sections")
+        item = self.items()[0]
+        self.assertEqual(item["summary"], "About Funnels.\n- a claim\nAction: try it")
+        self.assertEqual(item["x_post"], "Post about Funnels")
+        self.assertEqual(item["linkedin_post"], "Longer post about Funnels.\n\nSecond paragraph.")
+        self.run_tool("digest")
+        text = self.tg.sent()[0]["text"]
+        self.assertIn("<blockquote>Post about Funnels</blockquote>", text)
+        self.assertIn("<blockquote expandable>Longer post about Funnels.", text)
+        prompt = next(l for l in self.log.read_text().splitlines() if l.startswith("prompt "))
+        self.assertIn("Never invent an event", prompt)
+        self.assertIn("No em dashes", prompt)
+
     # ---- message packing
 
     def test_split_messages_stays_under_the_limit(self):
@@ -309,6 +324,24 @@ class VideoDigestTest(unittest.TestCase):
         self.assertLess(mod.tg_len(block), 4096)
         # every & is part of a whole entity: no "&am" or "&l" fragment at a cut
         self.assertNotRegex(block.replace("&amp;", "").replace("&lt;", "").replace("&gt;", ""), "&")
+
+    def test_parse_sections_handles_none_and_missing_markers(self):
+        mod = load_module()
+        out = mod.parse_sections("SUMMARY:\nNo speech in this video.\n\nX POST:\nnone\n\nLINKEDIN POST:\nNone.")
+        self.assertEqual(out, {"summary": "No speech in this video.", "x_post": "",
+                               "linkedin_post": ""})
+        out = mod.parse_sections("just a plain summary")
+        self.assertEqual(out["summary"], "just a plain summary")
+        self.assertEqual((out["x_post"], out["linkedin_post"]), ("", ""))
+
+    def test_worst_case_block_fits_one_message(self):
+        mod = load_module()
+        item = {"url": "https://x.example/" + "p" * 280, "status": "done", "uploader": "&" * 500,
+                "title": "&" * 2000, "summary": "&" * 5000, "x_post": "&" * 5000,
+                "linkedin_post": "&" * 5000}
+        header = "🎬 <b>Video digest · Thu 12 Nov</b> · 99 videos"
+        (text, idx), = mod.split_messages(header, [mod.format_item(item)])
+        self.assertLessEqual(mod.tg_len(text), 4096)
 
     def test_tg_len_counts_emoji_as_two(self):
         mod = load_module()
