@@ -420,6 +420,17 @@ class VideoDigestTest(unittest.TestCase):
         self.assertIn("no '## Patterns' section", self.items()[0]["error"])
         self.assertFalse([l for l in self.log.read_text().splitlines() if l.startswith("prompt ")])
 
+    def test_default_grab_names_the_keyring(self):
+        mod = load_module()
+        env = {k: v for k, v in self.env.items() if k != "VD_GRAB"}
+        done = subprocess.CompletedProcess([], 1, "", "grab: stop here")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(mod.subprocess, "run", return_value=done) as run:
+            with self.assertRaises(RuntimeError):
+                mod.process_one({"url": "https://youtu.be/one"})
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[argv.index("--cookies-from-browser") + 1], "chrome+gnomekeyring")
+
     def test_draft_starting_with_a_dash_is_not_a_flag(self):
         item = self.ready_item()
         self.press(f"vd:{item['id']}:x")

@@ -11,7 +11,7 @@ Config (environment; the systemd units load it from the files named in the READM
   TELEGRAM_CHAT_ID     the owner's chat: the only chat the bot listens to, writes to and obeys
   BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL   LinkedIn through Buffer (optional)
   VD_STATE_DIR         state and downloads (default ~/.local/state/video-digest)
-  VD_GRAB              grab command (default: grab --no-video --cookies-from-browser chrome)
+  VD_GRAB              grab command (default: grab --no-video --cookies-from-browser chrome+gnomekeyring)
   VD_SUMMARIZER        summary command, prompt on stdin (default: claude -p --model sonnet)
   VD_BIRD, VD_BUFFER   X and Buffer CLIs (default: bird and buffer on PATH)
   VD_KICK              command listen runs after queuing (default: start the process unit)
@@ -40,6 +40,9 @@ MAX_ATTEMPTS = 2
 TELEGRAM_LIMIT = 4096  # per message, counted in UTF-16 code units after entity parsing
 SUMMARY_TIMEOUT = 300
 GRAB_TIMEOUT = 1800
+# The keyring is named: under systemd there is no desktop session in the environment, so
+# yt-dlp guessed the wrong keyring, read no TikTok cookies, and TikTok asked for a login.
+GRAB_DEFAULT = "grab --no-video --cookies-from-browser chrome+gnomekeyring"
 
 PROMPT = """You work for Ivan, an Android and Flutter developer with 15 years of experience who \
 builds and ships a portfolio of indie mobile apps in public. Below are the metadata and the \
@@ -423,7 +426,7 @@ def parse_sections(text):
 
 
 def process_one(item):
-    grab = shlex.split(os.environ.get("VD_GRAB", "grab --no-video --cookies-from-browser chrome"))
+    grab = shlex.split(os.environ.get("VD_GRAB", GRAB_DEFAULT))
     out = state_dir() / "videos"
     # A hung download must not block the queue: TimeoutExpired counts as a failed attempt.
     res = subprocess.run(grab + ["-o", str(out), item["url"]], capture_output=True, text=True,
