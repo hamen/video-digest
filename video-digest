@@ -15,6 +15,8 @@ Config (environment; the systemd units load it from the files named in the READM
   VD_SUMMARIZER        summary command, prompt on stdin (default: claude -p --model sonnet)
   VD_BIRD, VD_BUFFER   X and Buffer CLIs (default: bird and buffer on PATH)
   VD_KICK              command listen runs after queuing (default: start the process unit)
+  VD_SLOP_FILE         AI Slop Detector skill; its pattern list goes into every prompt (default
+                       ~/code/ai-slop-detector/skills/ai-slop-detector/SKILL.md; missing = fail)
   TELEGRAM_API         Bot API base URL (default https://api.telegram.org; tests override it)
 """
 import contextlib
@@ -69,13 +71,18 @@ it; otherwise use the uploader handle with @. Never guess who speaks in a clip.
 - Ivan's own angle may use only these facts: he builds and ships indie mobile apps in public, \
 and he has 15 years of Android experience. Use at most one of them, in passing, and only where it \
 connects to the point; never restate them as a bio line. Never invent an event, a number, a \
-client, a story, a plan or a feeling about him.
+client, a story, a plan, a feeling, an opinion or an observation about him: no "I can see how \
+that plays out", no "I see this from both sides", no lesson he never stated. When in doubt, \
+report what the creator said and stop.
 - Plain, direct sentences. No em dashes, no hashtags, no emoji, no exclamation marks.
 - Never use: "here's the thing", "the truth is", "let that sink in", "game changer", "unlock", \
 "leverage", "delve", "journey", "it's not X, it's Y", "I keep thinking about", "the part I \
 liked", a question that you answer yourself, a closing question like "Thoughts?" or "Agree?", \
 one sentence per line, thread markers.
 - Write "none" for both posts if the video has nothing worth sharing.
+- Before you answer, check both posts against the AI slop patterns at the end of this prompt and \
+rewrite every sentence that matches one. Never invent a fact to replace a pattern: cut the \
+sentence instead. A closing line of wisdom (C-05, R-09) is the most common hit: end on a fact.
 
 Title: {title}
 Uploader: {uploader}
@@ -364,6 +371,21 @@ def cmd_listen(once=False):
 
 # ---------------------------------------------------------------- process
 
+def slop_patterns():
+    """The pattern list of the AI Slop Detector skill. Every draft goes through it, so a
+    missing file fails the video (a visible failure message) instead of skipping the check."""
+    path = Path(os.environ.get("VD_SLOP_FILE") or Path.home()
+                / "code/ai-slop-detector/skills/ai-slop-detector/SKILL.md")
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise RuntimeError(f"AI Slop Detector skill not readable: {e}") from e
+    start = text.find("## Patterns")
+    if start < 0:
+        raise RuntimeError(f"no '## Patterns' section in {path}")
+    return text[start:]
+
+
 def summarize(folder):
     info_path = folder / "video.info.json"
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
@@ -373,6 +395,7 @@ def summarize(folder):
         title=info.get("title", ""), uploader=info.get("uploader", ""),
         duration=info.get("duration", ""), description=(info.get("description") or "")[:1500],
         transcript=transcript[:60000])
+    prompt += "\n\nAI slop patterns (from the AI Slop Detector skill):\n\n" + slop_patterns()
     cmd = shlex.split(os.environ.get("VD_SUMMARIZER", "claude -p --model sonnet"))
     res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                          timeout=SUMMARY_TIMEOUT)

@@ -105,7 +105,8 @@ class VideoDigestTest(unittest.TestCase):
                         VD_BIRD=f"{sys.executable} {FAKES / 'fake_poster.py'} bird",
                         VD_BUFFER=f"{sys.executable} {FAKES / 'fake_poster.py'} buffer",
                         BUFFER_API_KEY="bk", BUFFER_LINKEDIN_CHANNEL="chan",
-                        VD_KICK=f"touch {self.tmp / 'kicked'}")
+                        VD_KICK=f"touch {self.tmp / 'kicked'}",
+                        VD_SLOP_FILE=str(FAKES / "slop.md"))
 
     def run_tool(self, *args, **env):
         return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True,
@@ -394,6 +395,21 @@ class VideoDigestTest(unittest.TestCase):
         self.assertEqual((one["status"], one["attempts"]), ("queued", 1))
         self.assertIn("TypeError", one["error"])
         self.assertEqual(two["status"], "done")
+
+    def test_every_prompt_carries_the_slop_patterns(self):
+        self.queue("https://youtu.be/one")
+        self.run_tool("process")
+        (prompt,) = [l for l in self.log.read_text().splitlines() if l.startswith("prompt ")]
+        self.assertIn("FAKE-SLOP-01", prompt)
+        self.assertNotIn("not part of the patterns", prompt)
+
+    def test_missing_slop_file_fails_the_video(self):
+        self.queue("https://youtu.be/one")
+        self.run_tool("process", VD_SLOP_FILE=str(self.tmp / "missing.md"))
+        item = self.items()[0]
+        self.assertEqual(item["status"], "queued")
+        self.assertIn("AI Slop Detector", item["error"])
+        self.assertNotIn("x_post", item)
 
     def test_draft_starting_with_a_dash_is_not_a_flag(self):
         item = self.ready_item()
