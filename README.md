@@ -7,7 +7,10 @@ out across the day, one tap each.
 
 1. **listen** (systemd service): reads the bot. A link from my chat (`TELEGRAM_CHAT_ID`) is
    queued, the bot replies "Queued 1 link", and processing starts at once. A button press from
-   my chat publishes a draft. Everyone else is ignored.
+   my chat publishes a draft. Everyone else is ignored. The words I write next to the link
+   ("lol this is my Monday") are my note: the X draft is built around them, and they are the
+   only opinion a draft may give me. No note for a forwarded message or a message with several
+   links; without a note the X draft only passes on what the creator says.
 2. **process** (started by listen; a timer reruns it every 10 minutes for retries):
    [`grab`](https://github.com/hamen/video-grabber) downloads and transcribes the video, and
    `claude -p --model sonnet` writes the summary and the two drafts. The drafts credit the

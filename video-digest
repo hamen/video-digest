@@ -39,6 +39,7 @@ from pathlib import Path
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 MAX_ATTEMPTS = 2
+NOTE_MAX = 1000  # characters of Ivan's note kept for the prompt
 TELEGRAM_LIMIT = 4096  # per message, counted in UTF-16 code units after entity parsing
 SUMMARY_TIMEOUT = 300
 GRAB_TIMEOUT = 1800
@@ -73,19 +74,25 @@ title and description only, and write "none" for both posts.
 Rules for the two posts:
 - Credit the creator. Use a real name only when the title, description or uploader name states \
 it; otherwise use the uploader handle with @. Never guess who speaks in a clip.
-- Ivan's own angle may use only these facts: he builds and ships indie mobile apps in public, \
-and he has 15 years of Android experience. Use at most one of them, in passing, and only where it \
-connects to the point; never restate them as a bio line. Never invent an event, a number, a \
-client, a story, a plan, a feeling, an opinion or an observation about him: no "I can see how \
-that plays out", no "I see this from both sides", no lesson he never stated. When in doubt, \
-report what the creator said and stop.
-- The X post follows the X voice guide below for rhythm, tone and emoji: \
-flowing first-person sentences, not clipped one-liners, and at most one emoji, only at the very \
-end. Where the guide shows personal stories, remember that you know none: the rules here on \
-facts about Ivan always win over the guide. Never write that Ivan liked, laughed at, agrees \
-with, tried or thinks anything: the post reports what the creator says. Use the emoji only when \
-the video itself is funny.
-- The LinkedIn post uses plain, direct sentences, no emoji. Neither post has em dashes, hashtags \
+- Ivan's note (right after the transcript below) is his own reaction to the \
+video. It is the only source of his opinions and feelings. Other facts about him you may use: \
+he builds and ships indie mobile apps in public, and he has 15 years of Android experience; use \
+at most one, in passing, never as a bio line. Never invent an event, a number, a client, a \
+story, a plan, a feeling, an opinion or an observation about him that his note does not state: \
+no "I can see how that plays out", no "I see this from both sides", no lesson he never stated.
+- The X post is written as Ivan, in first person, and follows the X voice guide below for \
+rhythm, tone and emoji. With a note: build the post around the note. Keep its meaning, its \
+side, its jokes and its swearing, and reuse his own words where they fit; open on the concrete \
+thing from the video that the note reacts to, then give his reaction, the way the approved \
+drafts in the guide do. Never soften his opinion and never add a second one. Without a note: \
+write one or two flowing sentences that pass on what the creator says, with no reaction, no \
+feeling and no opinion for Ivan, and not in the "Name says X. His fix is Y." style of a news \
+brief. In both cases: flowing sentences joined with "and", "because", "since", not clipped \
+one-liners; at most one emoji, only at the very end, and only when the note has one or the \
+video itself is funny. Where the guide shows personal stories, remember that you know only \
+what the note says.
+- The LinkedIn post uses plain, direct sentences, no emoji. It may give Ivan's opinion only \
+when his note states it, in plain words. Neither post has em dashes, hashtags \
 or exclamation marks.
 - Never use: "here's the thing", "the truth is", "let that sink in", "game changer", "unlock", \
 "leverage", "delve", "journey", "it's not X, it's Y", "I keep thinking about", "the part I \
@@ -205,6 +212,13 @@ def handle_message(msg, owner):
         return 0  # only the owner's chat; strangers who find the bot get nothing
     text = " ".join(filter(None, [msg.get("text"), msg.get("caption")]))
     urls = [u.rstrip(").,") for u in URL_RE.findall(text)]
+    # The rest of the message is Ivan's own take: the only opinion the X draft may give him.
+    # Not for a forwarded message (someone else's words), and not for several links, where
+    # nothing says which words go with which link.
+    note = " ".join(URL_RE.sub(" ", text).split())[:NOTE_MAX]
+    forwarded = any(k in msg for k in ("forward_origin", "forward_from", "forward_date"))
+    if forwarded or len(set(urls)) != 1 or not re.search(r"\w", note):
+        note = ""
     if not urls:
         reply(msg, "Send me a video link (TikTok, Instagram, YouTube…). "
                    "You get a summary and post drafts in a few minutes.")
@@ -214,7 +228,7 @@ def handle_message(msg, owner):
         new = [u for u in dict.fromkeys(urls) if u not in known]
         for u in new:
             data.append({"id": item_id(u), "url": u, "received_at": now(), "status": "queued",
-                         "attempts": 0})
+                         "attempts": 0, **({"note": note} if note else {})})
     if new:
         reply(msg, f"Queued {len(new)} link{'s' if len(new) > 1 else ''}. Drafts in a few minutes.")
         kick_processing()
@@ -414,7 +428,7 @@ def voice_guide():
     return text
 
 
-def summarize(folder):
+def summarize(folder, note=""):
     info_path = folder / "video.info.json"
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
     transcript_path = folder / "transcript.txt"
@@ -423,6 +437,9 @@ def summarize(folder):
         title=info.get("title", ""), uploader=info.get("uploader", ""),
         duration=info.get("duration", ""), description=(info.get("description") or "")[:1500],
         transcript=transcript[:60000])
+    # Concatenated, not formatted: the note is free text and may hold braces.
+    prompt += ("\n\nIvan's note on this video (his own words):\n" + note) if note else \
+        "\n\nIvan's note on this video: none."
     prompt += "\n\nX voice guide (from the ivan-x-voice skill):\n\n" + voice_guide()
     prompt += "\n\nAI slop patterns (from the AI Slop Detector skill):\n\n" + slop_patterns()
     cmd = shlex.split(os.environ.get("VD_SUMMARIZER", "claude -p --model sonnet"))
@@ -460,7 +477,7 @@ def process_one(item):
     if res.returncode != 0 or not lines:
         raise RuntimeError("grab failed: " + (res.stderr.strip().splitlines() or ["no output"])[-1])
     folder = Path(lines[-1])
-    info, summary = summarize(folder)
+    info, summary = summarize(folder, item.get("note", ""))
     sections = parse_sections(summary)
     # Store the drafts as the message shows them: a button publishes exactly what was seen.
     for key, budget in DRAFT_BUDGETS.items():
@@ -476,15 +493,16 @@ def cmd_process():
         # Read the queue again after each video: a link queued meanwhile joins this run,
         # because starting the unit while it runs does not start a second run.
         with items() as data:
-            url = next((i["url"] for i in data
+            nxt = next((i for i in data
                         if i["status"] == "queued" and i["url"] not in tried), None)
-        if url is None:
+        if nxt is None:
             break
+        url, note = nxt["url"], nxt.get("note", "")
         tried.add(url)
         log(f"processing {url}")
         # Work outside the lock: grab and the summary take minutes, and listen must keep queuing.
         try:
-            result, error = process_one({"url": url}), None
+            result, error = process_one({"url": url, "note": note}), None
         except Exception as e:  # one bad video is a failed attempt, never the end of the queue
             result, error = None, f"{type(e).__name__}: {e}"
         with items() as data:
