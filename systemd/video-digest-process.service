@@ -5,8 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# grab, uvx, claude and stt-file live in ~/.local/bin, which the systemd PATH lacks.
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# grab, claude and stt-file live in ~/.local/bin, uvx in linuxbrew; the systemd PATH lacks both.
+# Without uvx, grab falls back to the old ~/.local/bin/yt-dlp, and TikTok serves it broken audio.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/claude-telegram-bot-social/.env
 EnvironmentFile=%h/.config/video-digest/env
 # Headless auth for `claude -p` (same file as the standup cron); optional.
