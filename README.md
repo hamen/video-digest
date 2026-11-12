@@ -45,7 +45,9 @@ They expect the checkout at `~/code/video-digest`, `grab` and `claude` in `~/.lo
 and the Buffer CLI in `~/.npm-global/bin`
 (`npm install -g --prefix ~/.npm-global @bufferapp/cli`, outside mise, so a Node upgrade
 does not move it). They are systemd user units,
-not cron, because `--cookies-from-browser chrome` needs the desktop keyring over D-Bus.
+not cron, because `--cookies-from-browser chrome+gnomekeyring` needs the desktop keyring over
+D-Bus. The keyring must be named: without a desktop session in the environment, yt-dlp guesses
+wrong, sends no cookies, and TikTok answers "requiring login" for some videos.
 
 **One reader per bot.** Telegram gives each update to one `getUpdates` reader only. Keep
 `claude-telegram-bot-social.service` disabled; if it runs, link messages and button presses go
