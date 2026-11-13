@@ -61,10 +61,10 @@ SUMMARY:
 Action: <one concrete thing Ivan could try this week, or "none" if nothing applies>
 
 X POST:
-<a post for Ivan's X account, at most 270 characters, no link, in his voice (see the X voice guide below)>
+<a post for Ivan's X account, at most 250 characters, no link (the video link is added after it), in his voice (see the X voice guide below)>
 
 LINKEDIN POST:
-<a post for Ivan's LinkedIn, 60 to 150 words, in 2 or 3 short paragraphs>
+<a post for Ivan's LinkedIn, 60 to 150 words, in 2 or 3 short paragraphs, no link (the video link is added after it)>
 
 Rules for all sections:
 - Use only what the transcript and metadata say. Do not invent numbers, names, quotes or claims.
@@ -481,7 +481,7 @@ def process_one(item):
     sections = parse_sections(summary)
     # Store the drafts as the message shows them: a button publishes exactly what was seen.
     for key, budget in DRAFT_BUDGETS.items():
-        sections[key] = clip(sections[key], budget)
+        sections[key] = with_link(sections[key], item["url"], budget)
     return {"folder": str(folder), "title": info.get("title") or item["url"],
             "uploader": info.get("uploader") or "", "duration": info.get("duration"),
             **sections}
@@ -566,7 +566,8 @@ def tg_len(text):
     return len(text.encode("utf-16-le")) // 2
 
 
-DRAFT_BUDGETS = {"x_post": 450, "linkedin_post": 1500}
+DRAFT_BUDGETS = {"x_post": 600, "linkedin_post": 1500}
+LINK_MAX = 300  # a longer URL is not added: it would eat the draft (X counts any link as 23)
 
 
 def clip(text, budget):
@@ -575,6 +576,18 @@ def clip(text, budget):
     while tg_len(text) > budget and text:
         text = text[: max(0, int(len(text) * 0.9) - 1)].rstrip() + "…"
     return text
+
+
+def with_link(text, url, budget):
+    """Cut the draft so that it fits the budget with the video link after it, and add the
+    link. A post that points to the video it talks about reads better than one that does not.
+    No draft, no link; a URL over LINK_MAX is left out and the draft is only cut."""
+    if not text:
+        return text
+    if tg_len(url) > LINK_MAX:
+        return clip(text, budget)
+    suffix = "\n\n" + url
+    return clip(text, budget - tg_len(suffix)) + suffix
 
 
 def escape_clipped(text, budget):

@@ -290,10 +290,13 @@ class VideoDigestTest(unittest.TestCase):
         self.run_tool("process", FAKE_SUM="sections")
         item = self.items()[0]
         self.assertEqual(item["summary"], "About Funnels.\n- a claim\nAction: try it")
-        self.assertEqual(item["x_post"], "Post about Funnels")
-        self.assertEqual(item["linkedin_post"], "Longer post about Funnels.\n\nSecond paragraph.")
+        link = "\n\nhttps://youtu.be/one?title=Funnels"
+        self.assertEqual(item["x_post"], "Post about Funnels" + link)
+        self.assertEqual(item["linkedin_post"],
+                         "Longer post about Funnels.\n\nSecond paragraph." + link)
         text = self.tg.sent()[0]["text"]
-        self.assertIn("<blockquote>Post about Funnels</blockquote>", text)
+        self.assertIn("<blockquote>Post about Funnels\n\nhttps://youtu.be/one?title=Funnels</blockquote>",
+                      text)
         self.assertIn("<blockquote expandable>Longer post about Funnels.", text)
         prompt = next(l for l in self.log.read_text().splitlines() if l.startswith("prompt "))
         self.assertIn("Never invent an event", prompt)
@@ -374,7 +377,7 @@ class VideoDigestTest(unittest.TestCase):
     def test_x_button_posts_the_x_draft_once(self):
         item = self.ready_item()
         self.press(f"vd:{item['id']}:x")
-        self.assertEqual(self.posts(), ['post bird ["tweet", "--", "Post about One"]'])
+        self.assertEqual(self.posts(), ['post bird ["tweet", "--", "Post about One\\n\\nhttps://youtu.be/one?title=One"]'])
         self.assertTrue(self.items()[0].get("posted_x"))
         report = self.tg.sent()[0]
         self.assertEqual(report["text"], "✓ X: posted")
@@ -589,6 +592,17 @@ class VideoDigestTest(unittest.TestCase):
                 "title": "&" * 2000, "summary": "&" * 5000, "x_post": "&" * 5000,
                 "linkedin_post": "&" * 5000}
         self.assertLessEqual(parsed_len(mod, mod.format_item(item)), 4096)
+
+    def test_the_video_link_follows_the_draft_and_fits_the_budget(self):
+        mod = load_module()
+        url = "https://vm.tiktok.com/ZNabc/"
+        self.assertEqual(mod.with_link("A post", url, 600), "A post\n\n" + url)
+        long = mod.with_link("word " * 300, url, 600)
+        self.assertTrue(long.endswith("…\n\n" + url))
+        self.assertLessEqual(mod.tg_len(long), 600)
+        self.assertEqual(mod.with_link("", url, 600), "")
+        huge = "https://x.example/" + "p" * 300
+        self.assertEqual(mod.with_link("A post", huge, 600), "A post")
 
     def test_tg_len_counts_emoji_as_two(self):
         mod = load_module()
