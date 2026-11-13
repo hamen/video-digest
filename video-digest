@@ -584,7 +584,7 @@ def with_link(text, url, budget):
     No draft, no link; a URL over LINK_MAX is left out and the draft is only cut."""
     if not text:
         return text
-    if len(url) > LINK_MAX:
+    if tg_len(url) > LINK_MAX:
         return clip(text, budget)
     suffix = "\n\n" + url
     return clip(text, budget - tg_len(suffix)) + suffix
