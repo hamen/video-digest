@@ -14,7 +14,8 @@ out across the day, one tap each.
 2. **process** (started by listen; a timer reruns it every 10 minutes for retries):
    [`grab`](https://github.com/hamen/video-grabber) downloads and transcribes the video, and
    `claude -p --model sonnet` writes the summary and the two drafts. The drafts credit the
-   creator, may use only two facts about me, and must invent nothing. Then one message per
+   creator, may use only two facts about me, and must invent nothing. The code adds the video
+   link at the end of both drafts. Then one message per
    video, with buttons. A link that fails twice gets a failure message without buttons.
 3. **Buttons**: "Post on 𝕏" runs `bird tweet`, "Post on LinkedIn" runs the Buffer CLI with
    `shareNow` (the same tools as the standup button), "Both" does both. Each destination is
