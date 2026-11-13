@@ -58,6 +58,32 @@ wrong, sends no cookies, and TikTok answers "requiring login" for some videos.
 `claude-telegram-bot-social.service` disabled; if it runs, link messages and button presses go
 to whichever reader asks first.
 
+## Run your own
+
+This is my setup, published as it runs on my machine (Linux, systemd user units). To run it
+for yourself:
+
+- Create a bot with @BotFather. Put `TELEGRAM_BOT_TOKEN=...` and your own `TELEGRAM_CHAT_ID`
+  in `~/.config/video-digest/env` (see `contrib/env.example`), and delete the
+  `EnvironmentFile=%h/claude-telegram-bot-social/.env` line from **both** units in `systemd/`:
+  that is where my token lives.
+- Install [`grab`](https://github.com/hamen/video-grabber) and the Claude Code CLI.
+- Write your own voice guide (how you write on X, with real examples of your posts) and set
+  `VD_VOICE_FILE` to it. Mine is private, and a draft in my voice is no use to you.
+- Clone the [AI Slop Detector](https://github.com/FeedHive/ai-slop-detector) skill to
+  `~/code/ai-slop-detector`. `VD_SLOP_FILE` can point elsewhere, but `bin/install` checks the
+  default path.
+- Change what `PROMPT` in `video-digest` says about me: its first lines, and the facts about
+  me in "Rules for the two posts".
+- X needs a CLI that posts a tweet (`VD_BIRD`, I use `bird`) and LinkedIn the Buffer CLI; both buttons
+  are optional.
+
+The tests run with fakes for Telegram, grab, the summarizer and the posting CLIs: `bin/ci`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
 ## Operate
 
 ```bash
