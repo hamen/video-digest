@@ -63,15 +63,18 @@ to whichever reader asks first.
 This is my setup, published as it runs on my machine (Linux, systemd user units). To run it
 for yourself:
 
-- Create a bot with @BotFather and put `TELEGRAM_BOT_TOKEN=...` in an env file. Point the
-  `EnvironmentFile=` line of `systemd/video-digest-listen.service` at it.
-- Put your own chat id in `~/.config/video-digest/env` (see `contrib/env.example`).
+- Create a bot with @BotFather. Put `TELEGRAM_BOT_TOKEN=...` and your own `TELEGRAM_CHAT_ID`
+  in `~/.config/video-digest/env` (see `contrib/env.example`), and delete the
+  `EnvironmentFile=%h/claude-telegram-bot-social/.env` line from **both** units in `systemd/`:
+  that is where my token lives.
 - Install [`grab`](https://github.com/hamen/video-grabber) and the Claude Code CLI.
 - Write your own voice guide (how you write on X, with real examples of your posts) and set
   `VD_VOICE_FILE` to it. Mine is private, and a draft in my voice is no use to you.
-- Clone the [AI Slop Detector](https://github.com/FeedHive/ai-slop-detector) skill and set
-  `VD_SLOP_FILE` if it is not at the default path.
-- Change the first lines of `PROMPT` in `video-digest`: they describe me.
+- Clone the [AI Slop Detector](https://github.com/FeedHive/ai-slop-detector) skill to
+  `~/code/ai-slop-detector`. `VD_SLOP_FILE` can point elsewhere, but `bin/install` checks the
+  default path.
+- Change what `PROMPT` in `video-digest` says about me: its first lines, and the facts about
+  me in "Rules for the two posts".
 - X needs a CLI that posts a tweet (`VD_BIRD`, I use `bird`) and LinkedIn the Buffer CLI; both buttons
   are optional.
 
