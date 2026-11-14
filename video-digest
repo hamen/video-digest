@@ -10,6 +10,7 @@ Config (environment; the systemd units load it from the files named in the READM
   TELEGRAM_BOT_TOKEN   token of the bot
   TELEGRAM_CHAT_ID     the owner's chat: the only chat the bot listens to, writes to and obeys
   BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL   LinkedIn through Buffer (optional)
+  BUFFER_X_CHANNEL     X through Buffer too (optional; without it X goes through bird)
   VD_STATE_DIR         state and downloads (default ~/.local/state/video-digest)
   VD_GRAB              grab command (default: grab --no-video --cookies-from-browser chrome+gnomekeyring)
   VD_SUMMARIZER        summary command, prompt on stdin (default: claude -p --model sonnet)
@@ -351,18 +352,26 @@ def run_cli(cmd):
     return "ok", res.stdout.strip()[:300]
 
 
+def post_buffer(text, channel_var):
+    """Through the Buffer CLI, like the standup: shareNow, because the press is the approval."""
+    key, channel = os.environ.get("BUFFER_API_KEY"), os.environ.get(channel_var)
+    if not key or not channel:
+        return "failed", f"Buffer is not configured (BUFFER_API_KEY, {channel_var})"
+    return run_cli(shlex.split(os.environ.get("VD_BUFFER", "buffer")) + [
+        "posts", "create", "--channel-id", channel, f"--text={text}",
+        "--mode", "shareNow", "--scheduling-type", "automatic"])
+
+
 def post_x(text):
+    """Through Buffer when BUFFER_X_CHANNEL is set, so the stats of both networks are in one
+    place; otherwise straight to X with bird."""
+    if os.environ.get("BUFFER_X_CHANNEL"):
+        return post_buffer(text, "BUFFER_X_CHANNEL")
     return run_cli(shlex.split(os.environ.get("VD_BIRD", "bird")) + ["tweet", "--", text])
 
 
 def post_linkedin(text):
-    """Through the Buffer CLI, like the standup: shareNow, because the press is the approval."""
-    key, channel = os.environ.get("BUFFER_API_KEY"), os.environ.get("BUFFER_LINKEDIN_CHANNEL")
-    if not key or not channel:
-        return "failed", "Buffer is not configured (BUFFER_API_KEY, BUFFER_LINKEDIN_CHANNEL)"
-    return run_cli(shlex.split(os.environ.get("VD_BUFFER", "buffer")) + [
-        "posts", "create", "--channel-id", channel, f"--text={text}",
-        "--mode", "shareNow", "--scheduling-type", "automatic"])
+    return post_buffer(text, "BUFFER_LINKEDIN_CHANNEL")
 
 
 def cmd_listen(once=False):

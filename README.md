@@ -18,7 +18,9 @@ out across the day, one tap each.
    creator, may use only two facts about me, and must invent nothing. The code adds the video
    link at the end. Then one message per
    video, with buttons. A link that fails twice gets a failure message without buttons.
-3. **Buttons**: all three post the same draft. "Post on 𝕏" runs `bird tweet`, "Post on LinkedIn" runs the Buffer CLI with
+3. **Buttons**: all three post the same draft. "Post on 𝕏" goes through Buffer when
+   `BUFFER_X_CHANNEL` is set (I use this, so the stats of both networks are in one place), and
+   through `bird tweet` otherwise; "Post on LinkedIn" runs the Buffer CLI with
    `shareNow` (the same tools as the standup button), "Both" does both. Each destination is
    recorded the moment it succeeds: a second press says "already posted" and posts nothing.
    The bot replies under the video message with the result.

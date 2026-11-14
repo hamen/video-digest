@@ -104,7 +104,7 @@ class VideoDigestTest(unittest.TestCase):
                         VD_SUMMARIZER=f"{sys.executable} {FAKES / 'fake_summarizer.py'}",
                         VD_BIRD=f"{sys.executable} {FAKES / 'fake_poster.py'} bird",
                         VD_BUFFER=f"{sys.executable} {FAKES / 'fake_poster.py'} buffer",
-                        BUFFER_API_KEY="bk", BUFFER_LINKEDIN_CHANNEL="chan",
+                        BUFFER_API_KEY="bk", BUFFER_LINKEDIN_CHANNEL="chan", BUFFER_X_CHANNEL="",
                         VD_KICK=f"touch {self.tmp / 'kicked'}",
                         VD_SLOP_FILE=str(FAKES / "slop.md"),
                         VD_VOICE_FILE=str(FAKES / "voice.md"))
@@ -542,6 +542,30 @@ class VideoDigestTest(unittest.TestCase):
         self.press(f"vd:{item['id']}:x", update_id=61)
         self.assertTrue(self.items()[0].get("posted_x"))
         self.assertEqual(len(self.posts()), 2)
+
+    def test_x_goes_through_buffer_when_its_channel_is_set(self):
+        item = self.ready_item()
+        self.tg.updates = [{"update_id": 80, "callback_query": {
+            "id": "cb80", "from": {"id": int(OWNER)}, "data": f"vd:{item['id']}:x",
+            "message": {"message_id": 1, "chat": {"id": int(OWNER)}}}}]
+        self.run_tool("listen", "--once", BUFFER_X_CHANNEL="xchan")
+        (line,) = self.posts()
+        argv = json.loads(line[len("post buffer "):])
+        self.assertEqual(argv[argv.index("--channel-id") + 1], "xchan")
+        self.assertEqual(argv[argv.index("--mode") + 1], "shareNow")
+        self.assertTrue(self.items()[0].get("posted_x"))
+
+    def test_x_through_buffer_without_a_key_fails_and_never_falls_back_to_bird(self):
+        item = self.ready_item()
+        self.tg.updates = [{"update_id": 81, "callback_query": {
+            "id": "cb81", "from": {"id": int(OWNER)}, "data": f"vd:{item['id']}:x",
+            "message": {"message_id": 1, "chat": {"id": int(OWNER)}}}}]
+        self.tg.calls.clear()
+        self.run_tool("listen", "--once", BUFFER_X_CHANNEL="xchan", BUFFER_API_KEY="")
+        self.assertEqual(self.posts(), [])
+        self.assertIsNone(self.items()[0].get("posted_x"))
+        self.assertIn("Buffer is not configured (BUFFER_API_KEY, BUFFER_X_CHANNEL)",
+                      self.tg.sent()[0]["text"])
 
     def test_linkedin_without_buffer_config_says_so(self):
         item = self.ready_item()
