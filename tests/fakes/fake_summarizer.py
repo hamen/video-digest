@@ -14,7 +14,7 @@ if os.environ.get("FAKE_SUM") == "fail":
 title = next(l for l in prompt.splitlines() if l.startswith("Title: "))
 title = title[len("Title: "):]
 if os.environ.get("FAKE_SUM") == "sections":
-    print(f"SUMMARY:\nAbout {title}.\n- a claim\nAction: try it\n\nX POST:\nPost about {title}\n\n"
-          f"LINKEDIN POST:\nLonger post about {title}.\n\nSecond paragraph.")
+    print(f"SUMMARY:\nAbout {title}.\n- a claim\nAction: try it\n\n"
+          f"POST:\nPost about {title}.\n\nSecond paragraph.")
 else:
     print("SUMMARY " + title)
