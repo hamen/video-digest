@@ -291,16 +291,16 @@ class VideoDigestTest(unittest.TestCase):
         item = self.items()[0]
         self.assertEqual(item["summary"], "About Funnels.\n- a claim\nAction: try it")
         link = "\n\nhttps://youtu.be/one?title=Funnels"
-        self.assertEqual(item["x_post"], "Post about Funnels" + link)
-        self.assertEqual(item["linkedin_post"],
-                         "Longer post about Funnels.\n\nSecond paragraph." + link)
+        self.assertEqual(item["post"], "Post about Funnels.\n\nSecond paragraph." + link)
+        self.assertNotIn("x_post", item)
         text = self.tg.sent()[0]["text"]
-        self.assertIn("<blockquote>Post about Funnels\n\nhttps://youtu.be/one?title=Funnels</blockquote>",
-                      text)
-        self.assertIn("<blockquote expandable>Longer post about Funnels.", text)
+        self.assertIn("<b>Draft for 𝕏 and LinkedIn</b>\n<blockquote>Post about Funnels.\n\n"
+                      "Second paragraph.\n\nhttps://youtu.be/one?title=Funnels</blockquote>", text)
+        self.assertEqual(text.count("<blockquote"), 1)
         prompt = next(l for l in self.log.read_text().splitlines() if l.startswith("prompt "))
         self.assertIn("Never invent an event", prompt)
-        self.assertIn("Neither post has em dashes", prompt)
+        self.assertIn("no emoji, no em dashes", prompt)
+        self.assertIn("the same text goes to X and to LinkedIn", prompt)
 
     # ---- real-time messages
 
@@ -374,10 +374,11 @@ class VideoDigestTest(unittest.TestCase):
         self.run_tool("process", FAKE_SUM="sections")
         return self.items()[0]
 
-    def test_x_button_posts_the_x_draft_once(self):
+    def test_x_button_posts_the_draft_once(self):
         item = self.ready_item()
         self.press(f"vd:{item['id']}:x")
-        self.assertEqual(self.posts(), ['post bird ["tweet", "--", "Post about One\\n\\nhttps://youtu.be/one?title=One"]'])
+        self.assertEqual(self.posts(), ['post bird ["tweet", "--", "Post about One.\\n\\n'
+                                        'Second paragraph.\\n\\nhttps://youtu.be/one?title=One"]'])
         self.assertTrue(self.items()[0].get("posted_x"))
         report = self.tg.sent()[0]
         self.assertEqual(report["text"], "✓ X: posted")
@@ -448,7 +449,7 @@ class VideoDigestTest(unittest.TestCase):
         item = self.items()[0]
         self.assertEqual(item["status"], "queued")
         self.assertIn("AI Slop Detector", item["error"])
-        self.assertNotIn("x_post", item)
+        self.assertNotIn("post", item)
 
     def test_slop_file_without_patterns_section_fails_the_video(self):
         bad = self.tmp / "bad.md"
@@ -487,7 +488,7 @@ class VideoDigestTest(unittest.TestCase):
         self.run_tool("process", VD_VOICE_FILE=str(self.tmp / "missing.md"))
         item = self.items()[0]
         self.assertIn("ivan-x-voice", item["error"])
-        self.assertNotIn("x_post", item)
+        self.assertNotIn("post", item)
 
     def test_empty_or_front_matter_only_voice_file_fails_the_video(self):
         for i, body in enumerate(["", "---\nname: x\n---\n", "\ufeff---\r\nname: x\r\n---\r\n"]):
@@ -497,7 +498,7 @@ class VideoDigestTest(unittest.TestCase):
             self.run_tool("process", VD_VOICE_FILE=str(voice))
         for item in self.items():
             self.assertIn("ivan-x-voice", item["error"])
-            self.assertNotIn("x_post", item)
+            self.assertNotIn("post", item)
         self.assertFalse([l for l in self.log.read_text().splitlines() if l.startswith("prompt ")])
 
     def test_draft_starting_with_a_dash_is_not_a_flag(self):
@@ -520,8 +521,8 @@ class VideoDigestTest(unittest.TestCase):
         argv = json.loads(line[len("post buffer "):])
         self.assertEqual(argv[argv.index("--mode") + 1], "shareNow")
         self.assertEqual(argv[argv.index("--channel-id") + 1], "chan")
-        self.assertTrue(next(a for a in argv if a.startswith("--text=")).startswith(
-            "--text=Longer post about One."))
+        self.assertEqual(next(a for a in argv if a.startswith("--text=")),
+                         "--text=Post about One.\n\nSecond paragraph.\n\nhttps://youtu.be/one?title=One")
 
     def test_both_after_x_posts_only_linkedin(self):
         item = self.ready_item()
@@ -579,18 +580,16 @@ class VideoDigestTest(unittest.TestCase):
 
     def test_parse_sections_handles_none_and_missing_markers(self):
         mod = load_module()
-        out = mod.parse_sections("SUMMARY:\nNo speech in this video.\n\nX POST:\nnone\n\nLINKEDIN POST:\nNone.")
-        self.assertEqual(out, {"summary": "No speech in this video.", "x_post": "",
-                               "linkedin_post": ""})
+        out = mod.parse_sections("SUMMARY:\nNo speech in this video.\n\nPOST:\nNone.")
+        self.assertEqual(out, {"summary": "No speech in this video.", "post": ""})
         out = mod.parse_sections("just a plain summary")
         self.assertEqual(out["summary"], "just a plain summary")
-        self.assertEqual((out["x_post"], out["linkedin_post"]), ("", ""))
+        self.assertEqual(out["post"], "")
 
     def test_worst_case_block_fits_one_message(self):
         mod = load_module()
         item = {"url": "https://x.example/" + "p" * 280, "status": "done", "uploader": "&" * 500,
-                "title": "&" * 2000, "summary": "&" * 5000, "x_post": "&" * 5000,
-                "linkedin_post": "&" * 5000}
+                "title": "&" * 2000, "summary": "&" * 5000, "post": "&" * 5000}
         self.assertLessEqual(parsed_len(mod, mod.format_item(item)), 4096)
 
     def test_the_video_link_follows_the_draft_and_fits_the_budget(self):
@@ -603,6 +602,28 @@ class VideoDigestTest(unittest.TestCase):
         self.assertEqual(mod.with_link("", url, 600), "")
         huge = "https://x.example/" + "p" * 300
         self.assertEqual(mod.with_link("A post", huge, 600), "A post")
+
+    def test_old_items_pick_their_draft(self):
+        mod = load_module()
+        old = {"id": "abc", "x_post": "short X text", "linkedin_post": "the LinkedIn text"}
+        self.assertEqual(mod.draft_of(old), "the LinkedIn text")
+        self.assertEqual(len(mod.keyboard(old)["inline_keyboard"][0]), 3)
+        self.assertIn("the LinkedIn text", mod.format_item({**old, "url": "https://u", "status": "done",
+                                                            "summary": "s"}))
+        self.assertEqual(mod.draft_of({"x_post": "only X"}), "only X")
+        self.assertEqual(mod.draft_of({"post": "", "linkedin_post": "stale"}), "")
+        self.assertIsNone(mod.keyboard({"id": "abc", "post": "", "linkedin_post": "stale"}))
+
+    def test_x_button_on_an_old_item_posts_its_linkedin_draft(self):
+        item = self.ready_item()
+        state = self.tmp / "state" / "items.json"
+        data = json.loads(state.read_text())
+        data[0].pop("post")
+        data[0].update(x_post="short X text", linkedin_post="the LinkedIn text")
+        state.write_text(json.dumps(data))
+        self.press(f"vd:{item['id']}:both")
+        self.assertEqual(self.posts()[0], 'post bird ["tweet", "--", "the LinkedIn text"]')
+        self.assertIn("--text=the LinkedIn text", self.posts()[1])
 
     def test_tg_len_counts_emoji_as_two(self):
         mod = load_module()
