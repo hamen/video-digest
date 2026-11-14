@@ -2,22 +2,23 @@
 
 Turns the videos I like into posts. I share a TikTok, Instagram or YouTube link to the
 Telegram bot (@cwti_nuc_social_bot). A few minutes later the bot sends one message for that
-video: a summary, an X draft and a LinkedIn draft, with buttons to publish them. The posts go
+video: a summary and one draft, with buttons to publish it on X, on LinkedIn or on both. The posts go
 out across the day, one tap each.
 
 1. **listen** (systemd service): reads the bot. A link from my chat (`TELEGRAM_CHAT_ID`) is
    queued, the bot replies "Queued 1 link", and processing starts at once. A button press from
    my chat publishes a draft. Everyone else is ignored. The words I write next to the link
-   ("lol this is my Monday") are my note: the X draft is built around them, and they are the
-   only opinion a draft may give me. No note for a forwarded message or a message with several
-   links; without a note the X draft only passes on what the creator says.
+   ("lol this is my Monday") are my note: the draft is built around them, and they are the
+   only opinion it may give me. No note for a forwarded message or a message with several
+   links; without a note the draft only passes on what the creator says.
 2. **process** (started by listen; a timer reruns it every 10 minutes for retries):
    [`grab`](https://github.com/hamen/video-grabber) downloads and transcribes the video, and
-   `claude -p --model sonnet` writes the summary and the two drafts. The drafts credit the
+   `claude -p --model sonnet` writes the summary and one draft, in plain sentences that work on
+   both X and LinkedIn (I have X Premium, so the 280 limit does not apply). The draft credits the
    creator, may use only two facts about me, and must invent nothing. The code adds the video
-   link at the end of both drafts. Then one message per
+   link at the end. Then one message per
    video, with buttons. A link that fails twice gets a failure message without buttons.
-3. **Buttons**: "Post on 𝕏" runs `bird tweet`, "Post on LinkedIn" runs the Buffer CLI with
+3. **Buttons**: all three post the same draft. "Post on 𝕏" runs `bird tweet`, "Post on LinkedIn" runs the Buffer CLI with
    `shareNow` (the same tools as the standup button), "Both" does both. Each destination is
    recorded the moment it succeeds: a second press says "already posted" and posts nothing.
    The bot replies under the video message with the result.
@@ -41,7 +42,7 @@ The units read three more files and never copy them:
   (optional; without it the LinkedIn button says so).
 - `~/.config/claude-code-token.env`: headless auth for `claude -p`, like the standup cron.
 
-Every prompt also carries the `ivan-x-voice` skill for the X draft, read from
+Every prompt also carries the `ivan-x-voice` skill for my tone and wording, read from
 `~/.agents/skills/ivan-x-voice/SKILL.md` (`VD_VOICE_FILE` overrides it; missing = the video fails).
 Every prompt carries the pattern list of the AI Slop Detector skill, read from
 `~/code/ai-slop-detector/skills/ai-slop-detector/SKILL.md` (`VD_SLOP_FILE` overrides it); without
@@ -75,7 +76,7 @@ for yourself:
   `~/code/ai-slop-detector`. `VD_SLOP_FILE` can point elsewhere, but `bin/install` checks the
   default path.
 - Change what `PROMPT` in `video-digest` says about me: its first lines, and the facts about
-  me in "Rules for the two posts".
+  me in "Rules for the post".
 - X needs a CLI that posts a tweet (`VD_BIRD`, I use `bird`) and LinkedIn the Buffer CLI; both buttons
   are optional.
 
