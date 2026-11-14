@@ -543,6 +543,18 @@ class VideoDigestTest(unittest.TestCase):
         self.assertTrue(self.items()[0].get("posted_x"))
         self.assertEqual(len(self.posts()), 2)
 
+    def test_x_goes_through_buffer_when_its_channel_is_set(self):
+        item = self.ready_item()
+        self.tg.updates = [{"update_id": 80, "callback_query": {
+            "id": "cb80", "from": {"id": int(OWNER)}, "data": f"vd:{item['id']}:x",
+            "message": {"message_id": 1, "chat": {"id": int(OWNER)}}}}]
+        self.run_tool("listen", "--once", BUFFER_X_CHANNEL="xchan")
+        (line,) = self.posts()
+        argv = json.loads(line[len("post buffer "):])
+        self.assertEqual(argv[argv.index("--channel-id") + 1], "xchan")
+        self.assertEqual(argv[argv.index("--mode") + 1], "shareNow")
+        self.assertTrue(self.items()[0].get("posted_x"))
+
     def test_linkedin_without_buffer_config_says_so(self):
         item = self.ready_item()
         self.tg.updates = [{"update_id": 70, "callback_query": {
