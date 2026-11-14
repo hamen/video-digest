@@ -245,8 +245,11 @@ DESTS = {"x": ("X", "posted_x", "posting_x"),
 
 def draft_of(item):
     """The one draft that every button posts. Items processed before the single draft
-    have only the two old drafts: their LinkedIn draft is the one to post everywhere."""
-    return item.get("post") or item.get("linkedin_post") or ""
+    have only the two old drafts: their LinkedIn draft is the one to post everywhere (Ivan
+    chose it on 2026-11-14), and an X-only item keeps its X draft."""
+    if "post" in item:
+        return item["post"]
+    return item.get("linkedin_post") or item.get("x_post") or ""
 
 
 def update_item(item_id_, **fields):

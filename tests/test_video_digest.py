@@ -603,14 +603,27 @@ class VideoDigestTest(unittest.TestCase):
         huge = "https://x.example/" + "p" * 300
         self.assertEqual(mod.with_link("A post", huge, 600), "A post")
 
-    def test_an_old_item_posts_its_linkedin_draft_everywhere(self):
+    def test_old_items_pick_their_draft(self):
         mod = load_module()
         old = {"id": "abc", "x_post": "short X text", "linkedin_post": "the LinkedIn text"}
         self.assertEqual(mod.draft_of(old), "the LinkedIn text")
         self.assertEqual(len(mod.keyboard(old)["inline_keyboard"][0]), 3)
         self.assertIn("the LinkedIn text", mod.format_item({**old, "url": "https://u", "status": "done",
                                                             "summary": "s"}))
-        self.assertIsNone(mod.keyboard({"id": "abc", "x_post": "only X"}))
+        self.assertEqual(mod.draft_of({"x_post": "only X"}), "only X")
+        self.assertEqual(mod.draft_of({"post": "", "linkedin_post": "stale"}), "")
+        self.assertIsNone(mod.keyboard({"id": "abc", "post": "", "linkedin_post": "stale"}))
+
+    def test_x_button_on_an_old_item_posts_its_linkedin_draft(self):
+        item = self.ready_item()
+        state = self.tmp / "state" / "items.json"
+        data = json.loads(state.read_text())
+        data[0].pop("post")
+        data[0].update(x_post="short X text", linkedin_post="the LinkedIn text")
+        state.write_text(json.dumps(data))
+        self.press(f"vd:{item['id']}:both")
+        self.assertEqual(self.posts()[0], 'post bird ["tweet", "--", "the LinkedIn text"]')
+        self.assertIn("--text=the LinkedIn text", self.posts()[1])
 
     def test_tg_len_counts_emoji_as_two(self):
         mod = load_module()
